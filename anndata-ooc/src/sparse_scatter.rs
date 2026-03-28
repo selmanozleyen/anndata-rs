@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rayon::prelude::*;
 use zarrs::array::{Array, ArrayBytes, ArraySubset};
 use zarrs::storage::ReadableWritableListableStorageTraits;
 
@@ -141,55 +142,60 @@ impl SparseScatterer {
             }
         }
 
-        // Group batch assignments by store_id, then write each store's portion
+        // Group batch assignments by store_id, then write each store in parallel
         let n_stores = stores.len();
         let mut per_store: Vec<Vec<&RowAssignment>> = vec![Vec::new(); n_stores];
         for a in batch_assigns {
             per_store[a.store_id as usize].push(a);
         }
 
-        for (store_id, store_assigns) in per_store.iter().enumerate() {
-            if store_assigns.is_empty() {
-                continue;
-            }
-
-            // Sort by output_row to produce contiguous output intervals
-            let mut sorted: Vec<&&RowAssignment> = store_assigns.iter().collect();
-            sorted.sort_unstable_by_key(|a| a.output_row);
-
-            // Find contiguous output row ranges within this store
-            let runs = find_contiguous_output_runs(&sorted, &stores[store_id].out_indptr);
-
-            for run in &runs {
-                let dst_nnz_start = stores[store_id].out_indptr[run.out_start] as usize;
-                let dst_nnz_end = stores[store_id].out_indptr[run.out_end] as usize;
-                let total_nnz = dst_nnz_end - dst_nnz_start;
-                if total_nnz == 0 {
-                    continue;
+        // Assemble and flush each store's portion in parallel -- each store
+        // writes to independent arrays so there are no data races.
+        per_store.par_iter().enumerate().try_for_each(
+            |(store_id, store_assigns)| -> Result<()> {
+                if store_assigns.is_empty() {
+                    return Ok(());
                 }
 
-                let mut assembled_data = Vec::with_capacity(total_nnz * data_elem_size);
-                let mut assembled_indices = Vec::with_capacity(total_nnz * indices_elem_size);
+                let mut sorted: Vec<&&RowAssignment> = store_assigns.iter().collect();
+                sorted.sort_unstable_by_key(|a| a.output_row);
 
-                for out_row in run.out_start..run.out_end {
-                    let src_row = run.assignments_by_out[&out_row];
-                    if let Some((d, i)) = row_map.get(&src_row) {
-                        assembled_data.extend_from_slice(d);
-                        assembled_indices.extend_from_slice(i);
-                    }
-                }
-
-                let write_subset = ArraySubset::new_with_ranges(
-                    &[dst_nnz_start as u64..dst_nnz_end as u64],
+                let runs = find_contiguous_output_runs(
+                    &sorted, &stores[store_id].out_indptr,
                 );
-                stores[store_id].dst_data.store_array_subset(
-                    &write_subset, ArrayBytes::from(assembled_data),
-                )?;
-                stores[store_id].dst_indices.store_array_subset(
-                    &write_subset, ArrayBytes::from(assembled_indices),
-                )?;
-            }
-        }
+
+                for run in &runs {
+                    let dst_nnz_start = stores[store_id].out_indptr[run.out_start] as usize;
+                    let dst_nnz_end = stores[store_id].out_indptr[run.out_end] as usize;
+                    let total_nnz = dst_nnz_end - dst_nnz_start;
+                    if total_nnz == 0 {
+                        continue;
+                    }
+
+                    let mut assembled_data = Vec::with_capacity(total_nnz * data_elem_size);
+                    let mut assembled_indices = Vec::with_capacity(total_nnz * indices_elem_size);
+
+                    for out_row in run.out_start..run.out_end {
+                        let src_row = run.assignments_by_out[&out_row];
+                        if let Some((d, i)) = row_map.get(&src_row) {
+                            assembled_data.extend_from_slice(d);
+                            assembled_indices.extend_from_slice(i);
+                        }
+                    }
+
+                    let write_subset = ArraySubset::new_with_ranges(
+                        &[dst_nnz_start as u64..dst_nnz_end as u64],
+                    );
+                    stores[store_id].dst_data.store_array_subset(
+                        &write_subset, ArrayBytes::from(assembled_data),
+                    )?;
+                    stores[store_id].dst_indices.store_array_subset(
+                        &write_subset, ArrayBytes::from(assembled_indices),
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
 
         Ok(())
     }

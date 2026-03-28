@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use rayon::prelude::*;
 use zarrs::array::{Array, ArrayBytes, ArraySubset};
 use zarrs::storage::ReadableWritableListableStorageTraits;
 
@@ -140,8 +141,9 @@ impl DenseScatterer {
             }
         }
 
-        // Flush each chunk buffer to its destination store
-        for buf in &chunk_buffers {
+        // Flush chunk buffers in parallel -- each writes to an independent
+        // region of a (potentially different) destination store.
+        chunk_buffers.par_iter().try_for_each(|buf| -> Result<()> {
             let dst = dsts[buf.store_id as usize];
             let row_start = buf.row_start as u64;
             let row_end = (buf.row_start + buf.n_rows) as u64;
@@ -153,7 +155,8 @@ impl DenseScatterer {
 
             let bytes = ArrayBytes::from(buf.data.clone());
             dst.store_array_subset(&write_subset, bytes)?;
-        }
+            Ok(())
+        })?;
 
         Ok(())
     }
