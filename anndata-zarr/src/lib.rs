@@ -363,7 +363,7 @@ impl DatasetOp<Zarr> for ZarrDataset {
 
     fn reshape(&mut self, shape: &Shape) -> Result<()> {
         self.dataset
-            .set_shape(shape.as_ref().iter().map(|x| *x as u64).collect());
+            .set_shape(shape.as_ref().iter().map(|x| *x as u64).collect())?;
         self.dataset.store_metadata()?;
         Ok(())
     }
@@ -383,7 +383,7 @@ impl DatasetOp<Zarr> for ZarrDataset {
             if let Some(subset) = to_array_subset(sel) {
                 let arr: ndarray::ArrayD<T> = dataset
                     .dataset
-                    .retrieve_array_subset_ndarray_sharded_opt(
+                    .retrieve_array_subset_sharded_opt(
                         &dataset.cache,
                         &subset,
                         &CodecOptions::default(),
@@ -392,8 +392,9 @@ impl DatasetOp<Zarr> for ZarrDataset {
             } else {
                 let arr: ndarray::ArrayD<T> = dataset
                     .dataset
-                    .retrieve_array_subset_ndarray(&dataset.dataset.subset_all())?;
-                Ok(select(arr.view(), selection))
+                    .retrieve_array_subset(&dataset.dataset.subset_all())?;
+                let selected = select(arr.view(), selection);
+                Ok(selected.into_dimensionality::<D>()?)
             }
         }
 
@@ -446,9 +447,15 @@ impl DatasetOp<Zarr> for ZarrDataset {
                 .collect();
             if starts.len() == selection.ndim() {
                 let owned = arr.into_owned();
+                let shape: Vec<u64> = owned.shape().iter().map(|&s| s as u64).collect();
+                let ranges: Vec<_> = starts.iter().zip(&shape)
+                    .map(|(&start, &len)| start..start + len)
+                    .collect();
+                let subset = zarrs::array::ArraySubset::new_with_ranges(&ranges);
                 container
                     .dataset
-                    .store_array_subset_ndarray(starts.as_slice(), &owned)?;
+                    .store_array_subset(&subset, owned)?;
+                container.cache.clear();
             } else {
                 panic!("Not implemented");
             }
@@ -472,11 +479,10 @@ impl DatasetOp<Zarr> for ZarrDataset {
     }
 }
 
-fn select<'a, S, T, D>(arr: ArrayView<'a, T, D>, info: &[S]) -> Array<T, D>
+fn select<S, T>(arr: ArrayView<'_, T, IxDyn>, info: &[S]) -> ArrayD<T>
 where
     S: AsRef<SelectInfoElem>,
     T: Clone,
-    D: Dimension,
 {
     let arr = arr.into_dyn();
     let slices = info
@@ -506,8 +512,6 @@ where
             arr.index(new_idx.as_slice()).clone()
         })
     }
-    .into_dimensionality::<D>()
-    .unwrap()
 }
 
 fn str_to_prefix(s: &str) -> StorePrefix {
@@ -586,12 +590,14 @@ fn new_empty_dataset_helper<T: BackendData, S: ?Sized>(
 
     let use_sharding = !datatype.is::<StringDataType>();
 
+    let array_shape: Vec<u64> = shape_ref.iter().map(|x| *x as u64).collect();
+
     let array = if use_sharding {
         let shard_shape: Vec<u64> = chunk_size.iter().map(|&x| x * 8).collect();
         zarrs::array::ArrayBuilder::new(
-            shape_ref.iter().map(|x| *x as u64).collect(),
-            datatype,
+            array_shape,
             shard_shape,
+            datatype,
             fill,
         )
         .subchunk_shape(chunk_size)
@@ -599,9 +605,9 @@ fn new_empty_dataset_helper<T: BackendData, S: ?Sized>(
         .build(store, path)?
     } else {
         zarrs::array::ArrayBuilder::new(
-            shape_ref.iter().map(|x| *x as u64).collect(),
-            datatype,
+            array_shape,
             chunk_size,
+            datatype,
             fill,
         )
         .bytes_to_bytes_codecs(vec![Arc::new(ZstdCodec::new(7, false))])
@@ -616,8 +622,8 @@ mod tests {
     use super::*;
     use anndata::s;
     use ndarray::{array, concatenate, Array2, Axis, Ix2};
-    use ndarray_rand::rand_distr::Uniform;
     use ndarray_rand::RandomExt;
+    use ndarray_rand::rand_distr::Uniform;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -695,14 +701,14 @@ mod tests {
             let mut dataset =
                 group.new_empty_dataset::<i32>("test", &[20, 50].as_slice().into(), config)?;
 
-            let arr = Array::random((10, 10), Uniform::new(0, 100));
+            let arr = Array::random((10, 10), Uniform::new(0, 100).unwrap());
             dataset.write_array_slice(arr.view().into(), s![5..15, 10..20].as_ref())?;
             assert_eq!(
                 arr,
                 dataset.read_array_slice::<i32, _, _>(s![5..15, 10..20].as_ref())?
             );
 
-            let arr = Array::random((20, 50), Uniform::new(0, 100));
+            let arr = Array::random((20, 50), Uniform::new(0, 100).unwrap());
             dataset.write_array_slice(arr.view().into(), s![.., ..].as_ref())?;
             dataset.write_array_slice(arr.view().into(), s![.., ..].as_ref())?;
 
