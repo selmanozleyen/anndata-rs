@@ -32,17 +32,6 @@ impl Default for ScatterConfig {
     }
 }
 
-impl From<&crate::permute::PermuteConfig> for ScatterConfig {
-    fn from(pc: &crate::permute::PermuteConfig) -> Self {
-        Self {
-            memory_limit: pc.memory_limit,
-            chunk_size: pc.chunk_size,
-            shard_size: pc.shard_size,
-            target_shard_bytes: pc.target_shard_bytes,
-        }
-    }
-}
-
 /// Per-output-store configuration and metadata.
 pub struct OutputStoreConfig {
     pub path: PathBuf,
