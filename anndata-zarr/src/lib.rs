@@ -50,6 +50,12 @@ pub struct ZarrDataset {
     store: ZarrStore,
 }
 
+impl ZarrDataset {
+    pub fn inner(&self) -> &zarrs::array::Array<dyn ReadableWritableListableStorageTraits> {
+        &self.dataset
+    }
+}
+
 impl Backend for Zarr {
     const NAME: &'static str = "zarr";
 

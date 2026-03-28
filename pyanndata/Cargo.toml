@@ -15,6 +15,7 @@ keywords = ["data"]
 anndata = { workspace = true }
 anndata-hdf5 = { workspace = true }
 anndata-zarr = { workspace = true }
+anndata-ooc = { workspace = true }
 anyhow = "1.0"
 downcast-rs = "2"
 numpy = "0.27"

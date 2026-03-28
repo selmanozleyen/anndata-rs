@@ -13,6 +13,7 @@ use anndata_hdf5::H5;
 use anndata_zarr::Zarr;
 use anyhow::Result;
 use pyo3::prelude::*;
+use numpy::PyReadonlyArray1;
 use std::{
     collections::HashMap,
     ops::Deref,
@@ -332,4 +333,52 @@ pub fn read_dataset(
 pub enum LocationUpdate {
     Map(HashMap<String, PathBuf>),
     Dir(PathBuf),
+}
+
+/// Permute an AnnData Zarr store out-of-core.
+///
+/// Reorders observations (rows) of a .zarr AnnData according to a permutation
+/// index, writing the result to a new .zarr store. Runs entirely out-of-core
+/// with bounded memory usage -- the full dataset is never loaded into RAM.
+///
+/// Parameters
+/// ----------
+/// input : str | Path
+///     Path to the source .zarr AnnData store.
+/// output : str | Path
+///     Path for the destination .zarr store (will be created).
+/// permutation : numpy.ndarray[int64]
+///     1-D array where ``permutation[i]`` is the source row index for output
+///     row ``i``. Length determines the number of output rows (can be a subset).
+/// memory_limit : int, optional
+///     Maximum RAM in bytes for internal buffers. Default is 2 GB.
+///
+/// Examples
+/// --------
+/// >>> import numpy as np
+/// >>> import anndata_rs
+/// >>> perm = np.random.permutation(adata.n_obs).astype(np.int64)
+/// >>> anndata_rs.permute("input.zarr", "output.zarr", perm)
+#[pyfunction]
+#[pyo3(
+    signature = (input, output, permutation, *, memory_limit=None),
+    text_signature = "(input, output, permutation, *, memory_limit=None)",
+)]
+pub fn permute(
+    input: PathBuf,
+    output: PathBuf,
+    permutation: PyReadonlyArray1<i64>,
+    memory_limit: Option<usize>,
+) -> Result<()> {
+    let perm: Vec<usize> = permutation
+        .as_array()
+        .iter()
+        .map(|&v| v as usize)
+        .collect();
+
+    let config = anndata_ooc::PermuteConfig {
+        memory_limit: memory_limit.unwrap_or(2 * 1024 * 1024 * 1024),
+    };
+
+    anndata_ooc::permute_anndata(&input, &output, &perm, &config)
 }

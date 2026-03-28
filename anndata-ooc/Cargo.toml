@@ -1,0 +1,25 @@
+[package]
+name = "anndata-ooc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+authors = ["Kai Zhang <kai@kzhang.org>"]
+description = "Out-of-core permutation engine for anndata Zarr stores"
+license = "MIT"
+repository = "https://github.com/kaizhang/anndata-rs"
+homepage = "https://github.com/kaizhang/anndata-rs"
+
+[dependencies]
+anndata = { workspace = true }
+anndata-zarr = { workspace = true }
+anyhow = "1.0"
+ndarray = { version = "0.17", features = ["serde"] }
+zarrs = { version = "0.23", features = ["ndarray", "sharding", "zstd"] }
+rayon = "1.11"
+log = "0.4"
+smallvec = "1.15"
+
+[dev-dependencies]
+tempfile = "3.2"
+ndarray-rand = "0.16"
+env_logger = "0.11"
