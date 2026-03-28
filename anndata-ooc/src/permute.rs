@@ -15,12 +15,27 @@ use crate::sparse::SparsePermuter;
 pub struct PermuteConfig {
     /// Maximum RAM (in bytes) the engine may use for buffers.
     pub memory_limit: usize,
+    /// Sub-chunk size (rows per sub-chunk) for output arrays along axis 0.
+    /// When None, the backend default is used (min(n, 128) for 2-D numeric).
+    pub chunk_size: Option<usize>,
+    /// Shard size (rows per shard) for output arrays along axis 0.
+    /// Must be a multiple of chunk_size. When None, defaults to chunk_size * 8.
+    /// Ignored when target_shard_bytes is set.
+    pub shard_size: Option<usize>,
+    /// Target shard size in bytes. When set, the engine auto-calculates the
+    /// shard row count so that each shard is approximately this many bytes.
+    /// This is the most Lustre-friendly option: set it to the stripe size
+    /// (e.g. 4 * 1024 * 1024 for 4 MB stripes). Overrides shard_size.
+    pub target_shard_bytes: Option<usize>,
 }
 
 impl Default for PermuteConfig {
     fn default() -> Self {
         Self {
             memory_limit: 2 * 1024 * 1024 * 1024, // 2 GB
+            chunk_size: None,
+            shard_size: None,
+            target_shard_bytes: None,
         }
     }
 }
@@ -159,7 +174,7 @@ fn permute_dense_dataset<G: GroupOp<Zarr>>(
     permutation: &[usize],
     scalar_type: ScalarType,
     pool: &BufferPool,
-    _config: &PermuteConfig,
+    config: &PermuteConfig,
 ) -> Result<()> {
     let src_ds = src_group.open_dataset(name)?;
     let src_shape = src_ds.shape();
@@ -169,9 +184,11 @@ fn permute_dense_dataset<G: GroupOp<Zarr>>(
     let mut out_shape = src_shape.as_ref().to_vec();
     out_shape[0] = n_output;
 
-    let dst_ds = dst_group.new_empty_dataset_typed(
+    let mut dst_ds = dst_group.new_empty_dataset_typed_configured(
         name, scalar_type, &out_shape.into(),
+        config.chunk_size, config.shard_size, config.target_shard_bytes,
     )?;
+    copy_encoding_attrs(&src_ds, &mut dst_ds)?;
 
     let permuter = DensePermuter::new(pool.clone_with_same_budget());
     permuter.permute(src_ds.inner(), dst_ds.inner(), permutation)
@@ -190,9 +207,9 @@ fn permute_1d_dataset<G: GroupOp<Zarr>>(
 
     let mut out_shape = src_shape.as_ref().to_vec();
     out_shape[0] = permutation.len();
-    let dst_ds = dst_group.new_empty_dataset_typed(name, dtype, &out_shape.into())?;
+    let mut dst_ds = dst_group.new_empty_dataset_typed(name, dtype, &out_shape.into())?;
+    copy_encoding_attrs(&src_ds, &mut dst_ds)?;
 
-    // 1D arrays are small enough to permute in memory
     let full = read_dyn_slice(&src_ds, &[SelectInfoElem::from(0..n)], dtype)?;
     let permuted = permute_dyn_array_1d(&full, permutation);
     let write_sel = vec![SelectInfoElem::from(0..permutation.len())];
@@ -339,6 +356,19 @@ fn permute_1d_column<G: GroupOp<Zarr>>(
 
 // --- helpers ---
 
+fn copy_encoding_attrs(
+    src: &<Zarr as Backend>::Dataset,
+    dst: &mut <Zarr as Backend>::Dataset,
+) -> Result<()> {
+    if let Ok(enc) = src.get_json_attr("encoding-type") {
+        dst.new_json_attr("encoding-type", &enc)?;
+    }
+    if let Ok(ver) = src.get_json_attr("encoding-version") {
+        dst.new_json_attr("encoding-version", &ver)?;
+    }
+    Ok(())
+}
+
 use anndata::data::array::DynArray;
 
 fn read_dyn_slice(
@@ -448,7 +478,74 @@ trait GroupOpExt<B: Backend>: GroupOp<B> {
         dtype: ScalarType,
         shape: &anndata::data::slice::Shape,
     ) -> Result<B::Dataset> {
-        let config = anndata::backend::get_default_write_config();
+        self.new_empty_dataset_typed_configured(name, dtype, shape, None, None, None)
+    }
+
+    fn new_empty_dataset_typed_configured(
+        &self,
+        name: &str,
+        dtype: ScalarType,
+        shape: &anndata::data::slice::Shape,
+        chunk_size: Option<usize>,
+        shard_size: Option<usize>,
+        target_shard_bytes: Option<usize>,
+    ) -> Result<B::Dataset> {
+        let mut config = anndata::backend::get_default_write_config();
+        let ndim = shape.ndim();
+
+        let block = if let Some(cs) = chunk_size {
+            let mut b: Vec<usize> = shape.as_ref().to_vec();
+            b[0] = cs.min(b[0]);
+            for dim in b.iter_mut().skip(1) {
+                *dim = (*dim).min(if ndim == 1 { 16384 } else { 128 }).max(1);
+            }
+            Some(b)
+        } else {
+            None
+        };
+
+        if let Some(ref b) = block {
+            config.block_size = Some(b.clone().into());
+        }
+
+        // Resolve shard shape: target_shard_bytes takes priority over shard_size.
+        if target_shard_bytes.is_some() || shard_size.is_some() {
+            let chunk_rows = block.as_ref()
+                .map(|b| b[0])
+                .unwrap_or_else(|| shape.as_ref()[0].min(if ndim == 1 { 16384 } else { 128 }).max(1));
+
+            let shard_rows = if let Some(target_bytes) = target_shard_bytes {
+                let elem_size = scalar_type_elem_size(dtype);
+                // Use the shard column count (= sub-chunk columns), not full array width,
+                // since each shard only spans one sub-chunk in non-row dimensions.
+                let shard_cols: usize = block.as_ref()
+                    .map(|b| b.iter().skip(1).product::<usize>().max(1))
+                    .unwrap_or_else(|| {
+                        shape.as_ref().iter().skip(1)
+                            .map(|&x| x.min(if ndim == 1 { 16384 } else { 128 }).max(1))
+                            .product::<usize>().max(1)
+                    });
+                let row_bytes = shard_cols * elem_size;
+                let raw_rows = if row_bytes > 0 { target_bytes / row_bytes } else { chunk_rows };
+                let raw_rows = raw_rows.max(chunk_rows);
+                round_up_to(raw_rows, chunk_rows)
+            } else {
+                shard_size.unwrap()
+            };
+
+            let mut shard: Vec<usize> = block.as_ref()
+                .cloned()
+                .unwrap_or_else(|| {
+                    if ndim == 1 {
+                        vec![shape.as_ref()[0].min(16384).max(1)]
+                    } else {
+                        shape.as_ref().iter().map(|&x| x.min(128).max(1)).collect()
+                    }
+                });
+            shard[0] = shard_rows;
+            config.shard_size = Some(shard.into());
+        }
+
         macro_rules! dispatch {
             ($($variant:ident => $ty:ty),+ $(,)?) => {
                 match dtype {
@@ -465,3 +562,18 @@ trait GroupOpExt<B: Backend>: GroupOp<B> {
 }
 
 impl<T: GroupOp<Zarr>> GroupOpExt<Zarr> for T {}
+
+fn scalar_type_elem_size(dtype: ScalarType) -> usize {
+    match dtype {
+        ScalarType::U8 | ScalarType::I8 | ScalarType::Bool => 1,
+        ScalarType::U16 | ScalarType::I16 => 2,
+        ScalarType::U32 | ScalarType::I32 | ScalarType::F32 => 4,
+        ScalarType::U64 | ScalarType::I64 | ScalarType::F64 => 8,
+        ScalarType::String => 8, // conservative estimate for variable-length
+    }
+}
+
+fn round_up_to(value: usize, multiple: usize) -> usize {
+    if multiple == 0 { return value; }
+    ((value + multiple - 1) / multiple) * multiple
+}

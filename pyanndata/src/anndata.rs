@@ -352,6 +352,18 @@ pub enum LocationUpdate {
 ///     row ``i``. Length determines the number of output rows (can be a subset).
 /// memory_limit : int, optional
 ///     Maximum RAM in bytes for internal buffers. Default is 2 GB.
+/// chunk_size : int, optional
+///     Number of rows per output sub-chunk along axis 0. When None (default),
+///     the backend picks ``min(n_rows, 128)`` for 2-D arrays.
+/// shard_size : int, optional
+///     Number of rows per output shard (outer chunk) along axis 0. Must be a
+///     multiple of ``chunk_size``. When None, defaults to ``chunk_size * 8``.
+///     Ignored when ``target_shard_bytes`` is set.
+/// target_shard_bytes : int, optional
+///     Target shard size in bytes. The engine auto-calculates the shard row
+///     count so each shard is approximately this many bytes. Set to the Lustre
+///     stripe size (e.g. ``4 * 1024 * 1024`` for 4 MB) for optimal I/O
+///     alignment. Overrides ``shard_size`` when set.
 ///
 /// Examples
 /// --------
@@ -359,16 +371,22 @@ pub enum LocationUpdate {
 /// >>> import anndata_rs
 /// >>> perm = np.random.permutation(adata.n_obs).astype(np.int64)
 /// >>> anndata_rs.permute("input.zarr", "output.zarr", perm)
+/// >>> anndata_rs.permute("in.zarr", "out.zarr", perm, chunk_size=256)
+/// >>> anndata_rs.permute("in.zarr", "out.zarr", perm, shard_size=2048)
+/// >>> anndata_rs.permute("in.zarr", "out.zarr", perm, target_shard_bytes=4*1024*1024)
 #[pyfunction]
 #[pyo3(
-    signature = (input, output, permutation, *, memory_limit=None),
-    text_signature = "(input, output, permutation, *, memory_limit=None)",
+    signature = (input, output, permutation, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None),
+    text_signature = "(input, output, permutation, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None)",
 )]
 pub fn permute(
     input: PathBuf,
     output: PathBuf,
     permutation: PyReadonlyArray1<i64>,
     memory_limit: Option<usize>,
+    chunk_size: Option<usize>,
+    shard_size: Option<usize>,
+    target_shard_bytes: Option<usize>,
 ) -> Result<()> {
     let perm: Vec<usize> = permutation
         .as_array()
@@ -378,6 +396,9 @@ pub fn permute(
 
     let config = anndata_ooc::PermuteConfig {
         memory_limit: memory_limit.unwrap_or(2 * 1024 * 1024 * 1024),
+        chunk_size,
+        shard_size,
+        target_shard_bytes,
     };
 
     anndata_ooc::permute_anndata(&input, &output, &perm, &config)

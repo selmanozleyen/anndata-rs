@@ -599,7 +599,10 @@ fn new_empty_dataset_helper<T: BackendData, S: ?Sized>(
     let array_shape: Vec<u64> = shape_ref.iter().map(|x| *x as u64).collect();
 
     let array = if use_sharding {
-        let shard_shape: Vec<u64> = chunk_size.iter().map(|&x| x * 8).collect();
+        let shard_shape: Vec<u64> = match config.shard_size {
+            Some(s) => s.as_ref().iter().map(|x| (*x).max(1) as u64).collect(),
+            None => chunk_size.iter().map(|&x| x * 8).collect(),
+        };
         zarrs::array::ArrayBuilder::new(
             array_shape,
             shard_shape,

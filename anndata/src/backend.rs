@@ -19,7 +19,12 @@ pub enum Compression {
 #[derive(Debug, Clone)]
 pub struct WriteConfig {
     pub compression: Option<Compression>,
+    /// Sub-chunk (block) size. When None, the backend picks defaults.
     pub block_size: Option<Shape>,
+    /// Shard size (outer chunk that groups sub-chunks). When None, the backend
+    /// picks a default (typically block_size * 8). Must be a multiple of
+    /// block_size along each dimension when set.
+    pub shard_size: Option<Shape>,
 }
 
 impl Default for WriteConfig {
@@ -27,6 +32,7 @@ impl Default for WriteConfig {
         Self {
             compression: Some(Compression::Zst(5)),
             block_size: None,
+            shard_size: None,
         }
     }
 }
@@ -127,6 +133,7 @@ pub trait GroupOp<B: Backend + ?Sized> {
         let new_config = WriteConfig {
             compression: compression,
             block_size: Some(block_size),
+            shard_size: None,
         };
         let dataset = self.new_empty_dataset::<D>(name, &shape.into(), new_config)?;
         dataset.write_array(arr)?;
