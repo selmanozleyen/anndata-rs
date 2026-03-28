@@ -403,3 +403,67 @@ pub fn permute(
 
     anndata_ooc::permute_anndata(&input, &output, &perm, &config)
 }
+
+/// Split an AnnData Zarr store by the values of an obs column.
+///
+/// Each unique value in the specified observation column becomes a separate
+/// output .zarr store under ``output_dir``. The split is performed out-of-core:
+/// the source data matrix is read once and scattered to all outputs in a single
+/// pass (per memory-budget batch).
+///
+/// Parameters
+/// ----------
+/// input : str | Path
+///     Path to the source .zarr AnnData store.
+/// output_dir : str | Path
+///     Directory where output stores will be created.
+///     Each store is named ``{value}.zarr``.
+/// column : str
+///     Name of the obs column to split by.
+/// memory_limit : int, optional
+///     Maximum RAM in bytes for internal buffers. Default is 2 GB.
+/// chunk_size : int, optional
+///     Number of rows per output sub-chunk along axis 0.
+/// shard_size : int, optional
+///     Number of rows per output shard along axis 0.
+/// target_shard_bytes : int, optional
+///     Target shard size in bytes. Overrides ``shard_size`` when set.
+///
+/// Returns
+/// -------
+/// list of (str, str)
+///     List of (column_value, output_path) pairs for each group.
+///
+/// Examples
+/// --------
+/// >>> import anndata_rs
+/// >>> groups = anndata_rs.split("input.zarr", "splits/", "cell_type")
+/// >>> for value, path in groups:
+/// ...     print(f"{value} -> {path}")
+#[pyfunction]
+#[pyo3(
+    signature = (input, output_dir, column, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None),
+    text_signature = "(input, output_dir, column, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None)",
+)]
+pub fn split(
+    input: PathBuf,
+    output_dir: PathBuf,
+    column: String,
+    memory_limit: Option<usize>,
+    chunk_size: Option<usize>,
+    shard_size: Option<usize>,
+    target_shard_bytes: Option<usize>,
+) -> Result<Vec<(String, String)>> {
+    let config = anndata_ooc::ScatterConfig {
+        memory_limit: memory_limit.unwrap_or(2 * 1024 * 1024 * 1024),
+        chunk_size,
+        shard_size,
+        target_shard_bytes,
+    };
+
+    let results = anndata_ooc::split_anndata(&input, &output_dir, &column, &config)?;
+
+    Ok(results.into_iter().map(|(val, path)| {
+        (val, path.display().to_string())
+    }).collect())
+}

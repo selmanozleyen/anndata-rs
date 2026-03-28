@@ -411,3 +411,139 @@ class TestAnnDataRsRoundtrip:
         R_py = py_result.X
         np.testing.assert_allclose(R_rs, R_py, atol=1e-12)
         rs_result.close()
+
+
+class TestDuplicateIndices:
+    """Permutation with duplicate source rows (copying data)."""
+
+    def test_duplicate_rows_dense(self, zarr_pair):
+        src, dst = zarr_pair
+        np.random.seed(70)
+        X = np.random.randn(50, 20).astype(np.float32)
+        _make_adata(src, X)
+
+        # Output has 80 rows, many duplicates
+        perm = np.array([0, 0, 0, 1, 1, 2, 3, 3] + list(range(50)) + [49]*22,
+                        dtype=np.int64)
+        anndata_rs.permute(src, dst, perm)
+
+        result = ad.read_zarr(dst)
+        assert result.X.shape[0] == len(perm)
+        np.testing.assert_allclose(result.X, X[perm], atol=1e-6)
+
+    def test_duplicate_rows_sparse(self, zarr_pair):
+        src, dst = zarr_pair
+        np.random.seed(71)
+        dense = np.random.randn(40, 30).astype(np.float32)
+        dense[dense < 0.5] = 0
+        X = csr_matrix(dense)
+        _make_adata(src, X)
+
+        perm = np.array([5, 5, 5, 10, 10, 0] + list(range(40)),
+                        dtype=np.int64)
+        anndata_rs.permute(src, dst, perm)
+
+        result = ad.read_zarr(dst)
+        actual = result.X.toarray() if issparse(result.X) else result.X
+        np.testing.assert_allclose(actual, dense[perm], atol=1e-6)
+
+
+class TestSubsetPermute:
+    """Permutation that discards rows (output smaller than input)."""
+
+    def test_subset_dense(self, zarr_pair):
+        src, dst = zarr_pair
+        np.random.seed(80)
+        X = np.random.randn(200, 30).astype(np.float32)
+        _make_adata(src, X)
+
+        perm = np.array([10, 20, 30, 40, 50], dtype=np.int64)
+        anndata_rs.permute(src, dst, perm)
+
+        result = ad.read_zarr(dst)
+        assert result.X.shape[0] == 5
+        np.testing.assert_allclose(result.X, X[perm], atol=1e-6)
+
+    def test_subset_sparse(self, zarr_pair):
+        src, dst = zarr_pair
+        np.random.seed(81)
+        dense = np.random.randn(100, 40).astype(np.float32)
+        dense[dense < 0.5] = 0
+        X = csr_matrix(dense)
+        _make_adata(src, X)
+
+        perm = np.random.choice(100, 20, replace=False).astype(np.int64)
+        anndata_rs.permute(src, dst, perm)
+
+        result = ad.read_zarr(dst)
+        actual = result.X.toarray() if issparse(result.X) else result.X
+        assert actual.shape[0] == 20
+        np.testing.assert_allclose(actual, dense[perm], atol=1e-6)
+
+
+class TestSplit:
+    """Tests for anndata_rs.split -- split by obs column."""
+
+    @pytest.fixture
+    def split_src(self, tmp_path):
+        """Create a source AnnData with a cell_type column."""
+        src = tmp_path / "src.zarr"
+        np.random.seed(90)
+        n = 120
+        X = np.random.randn(n, 30).astype(np.float32)
+        types = np.array(["T_cell", "B_cell", "NK_cell"] * 40)
+        obs = pd.DataFrame({
+            "cell_type": types,
+            "score": np.random.randn(n).astype(np.float32),
+        }, index=[f"cell_{i}" for i in range(n)])
+        _make_adata(str(src), X, obs=obs)
+        return str(src), tmp_path, X, obs
+
+    def test_split_by_column(self, split_src, tmp_path):
+        src, base, X, obs = split_src
+        out_dir = str(tmp_path / "split_out")
+
+        groups = anndata_rs.split(src, out_dir, "cell_type")
+
+        assert len(groups) > 0
+        # Verify each group
+        total_rows = 0
+        for value, path in groups:
+            result = ad.read_zarr(path)
+            n_expected = (obs["cell_type"] == value).sum()
+            assert result.X.shape[0] == n_expected, \
+                f"Group '{value}': expected {n_expected} rows, got {result.X.shape[0]}"
+            assert result.X.shape[1] == 30
+
+            # Verify X values match
+            mask = obs["cell_type"] == value
+            expected_X = X[mask.values]
+            np.testing.assert_allclose(result.X, expected_X, atol=1e-6)
+            total_rows += result.X.shape[0]
+
+        assert total_rows == 120, f"Total rows {total_rows} != 120"
+
+    def test_split_preserves_var(self, split_src, tmp_path):
+        src, base, X, obs = split_src
+        out_dir = str(tmp_path / "split_var")
+
+        groups = anndata_rs.split(src, out_dir, "cell_type")
+
+        src_ad = ad.read_zarr(src)
+        for _, path in groups:
+            result = ad.read_zarr(path)
+            assert list(result.var.index) == list(src_ad.var.index)
+
+    def test_split_obs_columns(self, split_src, tmp_path):
+        src, base, X, obs = split_src
+        out_dir = str(tmp_path / "split_obs")
+
+        groups = anndata_rs.split(src, out_dir, "cell_type")
+
+        for value, path in groups:
+            result = ad.read_zarr(path)
+            mask = obs["cell_type"] == value
+            expected_scores = obs.loc[mask, "score"].values
+            np.testing.assert_allclose(
+                result.obs["score"].values, expected_scores, atol=1e-6,
+            )
