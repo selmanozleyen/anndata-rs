@@ -10,6 +10,7 @@ use anndata;
 use anndata::concat::JoinType;
 use anndata::Backend;
 use anndata_hdf5::H5;
+use anndata_zarr::Zarr;
 use anyhow::Result;
 use pyo3::prelude::*;
 use std::{
@@ -25,6 +26,7 @@ pub(crate) fn get_backend<P: AsRef<Path>>(filename: P, backend: Option<&str>) ->
         if let Some(ext) = filename.as_ref().extension() {
             match ext.to_str().unwrap() {
                 "h5ad" | "h5" | "h5ads" => H5::NAME,
+                "zarr" | "zrad" => Zarr::NAME,
                 _ => H5::NAME,
             }
         } else {
@@ -127,6 +129,7 @@ pub fn concat<'py>(
 
     enum T<'a> {
         H5(anndata::AnnData<H5>),
+        Zarr(anndata::AnnData<Zarr>),
         Py(PyAnnData<'a>),
     }
 
@@ -137,6 +140,10 @@ pub fn concat<'py>(
             H5::NAME => {
                 let adata = anndata::AnnData::<H5>::new(file)?;
                 T::H5(adata)
+            }
+            Zarr::NAME => {
+                let adata = anndata::AnnData::<Zarr>::new(file)?;
+                T::Zarr(adata)
             }
             backend => todo!("Backend {} is not supported", backend),
         }
@@ -156,6 +163,20 @@ pub fn concat<'py>(
                     let adatas: Vec<_> = adatas.iter().map(|x| x.deref()).collect();
                     match &out {
                         T::H5(out) => anndata::concat::concat(&adatas, join, label, keys, out)?,
+                        T::Zarr(out) => anndata::concat::concat(&adatas, join, label, keys, out)?,
+                        T::Py(out) => anndata::concat::concat(&adatas, join, label, keys, out)?,
+                    }
+                }
+                Zarr::NAME => {
+                    let adatas = adatas
+                        .into_iter()
+                        .map(|x| x.extract::<AnnData>(py).unwrap())
+                        .collect::<Vec<_>>();
+                    let adatas: Vec<_> = adatas.iter().map(|x| x.inner_ref::<Zarr>()).collect();
+                    let adatas: Vec<_> = adatas.iter().map(|x| x.deref()).collect();
+                    match &out {
+                        T::H5(out) => anndata::concat::concat(&adatas, join, label, keys, out)?,
+                        T::Zarr(out) => anndata::concat::concat(&adatas, join, label, keys, out)?,
                         T::Py(out) => anndata::concat::concat(&adatas, join, label, keys, out)?,
                     }
                 }
@@ -168,6 +189,7 @@ pub fn concat<'py>(
                 .collect::<Vec<_>>();
             match &out {
                 T::H5(out) => anndata::concat::concat(&adatas, join, label, keys, out)?,
+                T::Zarr(out) => anndata::concat::concat(&adatas, join, label, keys, out)?,
                 T::Py(out) => anndata::concat::concat(&adatas, join, label, keys, out)?,
             }
         }
@@ -175,6 +197,7 @@ pub fn concat<'py>(
 
     match out {
         T::H5(adata) => Ok(AnnData::from(adata).into_pyobject(py)?.into_any()),
+        T::Zarr(adata) => Ok(AnnData::from(adata).into_pyobject(py)?.into_any()),
         T::Py(adata) => Ok(adata.into_pyobject(py)?.into_any()),
     }
 }
@@ -226,6 +249,11 @@ pub fn read_mtx<'py>(
         match backend {
             H5::NAME => {
                 let adata = anndata::AnnData::<H5>::new(file)?;
+                reader.finish(&adata)?;
+                Ok(AnnData::from(adata).into_pyobject(py)?.into_any())
+            }
+            Zarr::NAME => {
+                let adata = anndata::AnnData::<Zarr>::new(file)?;
                 reader.finish(&adata)?;
                 Ok(AnnData::from(adata).into_pyobject(py)?.into_any())
             }
@@ -284,9 +312,17 @@ pub fn read_dataset(
             let file = match mode {
                 "r" => H5::open(filename)?,
                 "r+" => H5::open_rw(filename)?,
-                _ => panic!("Unkown mode"),
+                _ => panic!("Unknown mode"),
             };
             Ok(anndata::AnnDataSet::<H5>::open(file, adata_files_update)?.into())
+        }
+        Zarr::NAME => {
+            let file = match mode {
+                "r" => Zarr::open(filename)?,
+                "r+" => Zarr::open_rw(filename)?,
+                _ => panic!("Unknown mode"),
+            };
+            Ok(anndata::AnnDataSet::<Zarr>::open(file, adata_files_update)?.into())
         }
         _ => todo!(),
     }
