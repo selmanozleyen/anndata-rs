@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, Context};
 use ndarray::{Array1, ArrayD, Ix1};
@@ -15,6 +16,10 @@ use crate::dense_scatter::DenseScatterer;
 use crate::sparse_scatter::{SparseScatterer, SparseStoreArrays};
 use crate::scatter::RowAssignment;
 
+/// Shared progress counter: bytes of compressed output written so far.
+/// Atomically incremented by the Rust engine; can be polled from Python.
+pub type ProgressCounter = Arc<AtomicU64>;
+
 /// Configuration for the scatter engine (shared across all output stores).
 pub struct ScatterConfig {
     pub memory_limit: usize,
@@ -25,6 +30,8 @@ pub struct ScatterConfig {
     /// source file's compression (falls back to 3 if undetectable).
     /// 0 = no compression.
     pub compression_level: Option<u8>,
+    /// Optional shared counter incremented as bytes are written.
+    pub progress: Option<ProgressCounter>,
 }
 
 impl Default for ScatterConfig {
@@ -35,6 +42,7 @@ impl Default for ScatterConfig {
             shard_size: None,
             target_shard_bytes: None,
             compression_level: None,
+            progress: None,
         }
     }
 }
@@ -515,7 +523,10 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
     log::info!("scatter_csr '{}': starting scatter_data_indices ({:.1}s since csr_group start)",
         name, csr_t0.elapsed().as_secs_f64());
 
-    let scatterer = SparseScatterer::new(pool.clone_with_same_budget());
+    let scatterer = SparseScatterer::new(
+        pool.clone_with_same_budget(),
+        config.base.progress.clone(),
+    );
     scatterer.scatter_data_indices(
         src_indices_ds.inner(),
         src_data_ds.inner(),

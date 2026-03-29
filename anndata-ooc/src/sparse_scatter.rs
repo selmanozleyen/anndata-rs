@@ -8,6 +8,7 @@ use zarrs::storage::ReadableWritableListableStorageTraits;
 
 use crate::budget::BufferPool;
 use crate::scatter::{RowAssignment, ScatterPlanner, SparseScatterPass, SparseScatterEntry};
+use crate::scatter_engine::ProgressCounter;
 
 /// Per-store CSR arrays and indptr for the scatter engine.
 pub struct SparseStoreArrays<'a, S: ?Sized> {
@@ -25,11 +26,12 @@ pub struct SparseStoreArrays<'a, S: ?Sized> {
 /// and writes overlap with no barrier.
 pub struct SparseScatterer {
     pool: BufferPool,
+    progress: Option<ProgressCounter>,
 }
 
 impl SparseScatterer {
-    pub fn new(pool: BufferPool) -> Self {
-        Self { pool }
+    pub fn new(pool: BufferPool, progress: Option<ProgressCounter>) -> Self {
+        Self { pool, progress }
     }
 
     pub fn scatter_data_indices<S>(
@@ -239,6 +241,7 @@ impl SparseScatterer {
                             if prev == 1 {
                                 if let Err(e) = flush_chunk(
                                     buf, stores, data_elem_size, indices_elem_size,
+                                    &self.progress,
                                 ) {
                                     flush_errors.lock().unwrap().push(e);
                                 }
@@ -305,6 +308,7 @@ impl SparseScatterer {
                         if prev == 1 {
                             if let Err(e) = flush_chunk(
                                 buf, stores, data_elem_size, indices_elem_size,
+                                &self.progress,
                             ) {
                                 flush_errors.lock().unwrap().push(e);
                             }
@@ -332,7 +336,7 @@ impl SparseScatterer {
                 && buf.remaining.load(Ordering::Acquire) == 0
                 && (buf.nnz_end > buf.nnz_start)
             {
-                flush_chunk(buf, stores, data_elem_size, indices_elem_size)?;
+                flush_chunk(buf, stores, data_elem_size, indices_elem_size, &self.progress)?;
             }
         }
 
@@ -342,12 +346,12 @@ impl SparseScatterer {
     }
 }
 
-/// Flush a completed destination chunk buffer to disk.
 fn flush_chunk<S>(
     buf: &DstChunkBuf,
     stores: &[SparseStoreArrays<'_, S>],
     _data_elem_size: usize,
     _indices_elem_size: usize,
+    progress: &Option<ProgressCounter>,
 ) -> Result<()>
 where
     S: ReadableWritableListableStorageTraits + ?Sized + 'static,
@@ -364,8 +368,6 @@ where
         &[buf.nnz_start as u64..buf.nnz_end as u64],
     );
 
-    // Safety: we only reach here after all writers have finished (atomic
-    // counter hit zero with AcqRel ordering), so reading the buffers is safe.
     store.dst_data.store_array_subset(
         &write_subset,
         ArrayBytes::from(buf.data_buf.as_slice()),
@@ -374,6 +376,11 @@ where
         &write_subset,
         ArrayBytes::from(buf.indices_buf.as_slice()),
     )?;
+
+    if let Some(ctr) = progress {
+        let written = (buf.data_buf.len() + buf.indices_buf.len()) as u64;
+        ctr.fetch_add(written, Ordering::Relaxed);
+    }
 
     Ok(())
 }
