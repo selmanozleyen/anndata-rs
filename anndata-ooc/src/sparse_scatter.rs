@@ -58,7 +58,11 @@ impl SparseScatterer {
             usize::MAX
         };
 
-        // Attempt NNZ-chunk passthrough for identity-mapped prefix
+        // Attempt NNZ-chunk passthrough for identity-mapped prefix.
+        // For 1D arrays, store_encoded_chunk writes the raw blob for
+        // one storage key (= one shard when sharding is active).
+        // We only copy a shard if its entire NNZ range falls within the
+        // identity prefix so the scatter path never touches the same shard.
         let mut passthrough_data_chunks = 0usize;
         let mut passthrough_indices_chunks = 0usize;
         let mut passthrough_rows: HashSet<(u16, usize)> = HashSet::new();
@@ -70,8 +74,6 @@ impl SparseScatterer {
                 let sid = store_id as u16;
                 let out_indptr = &store.out_indptr;
 
-                // Find the longest identity prefix: consecutive rows where
-                // source_row == output_row starting from row 0
                 let mut prefix_end = 0usize;
                 let n_out_rows = out_indptr.len().saturating_sub(1);
                 for r in 0..n_out_rows {
@@ -86,10 +88,8 @@ impl SparseScatterer {
                     continue;
                 }
 
-                // NNZ range covered by the identity prefix
                 let identity_nnz_end = src_indptr[prefix_end] as usize;
 
-                // Copy data chunks that are fully within the identity NNZ range
                 let dc = passthrough_1d_chunks(
                     src_data, store.dst_data, identity_nnz_end,
                 )?;
@@ -111,7 +111,6 @@ impl SparseScatterer {
             stores.len(), assignments.len(), passthrough_data_chunks, passthrough_indices_chunks
         );
 
-        // Filter assignments to exclude rows handled by passthrough
         let effective_assignments: Vec<&RowAssignment> = if passthrough_rows.is_empty() {
             assignments.iter().collect()
         } else {
@@ -272,8 +271,13 @@ impl SparseScatterer {
     }
 }
 
-/// Copy 1D encoded chunks from src to dst that are fully within
-/// [0, identity_nnz_end). Returns the number of chunks copied.
+/// Copy 1D encoded chunks from src to dst whose entire storage key
+/// (shard/chunk) falls within [0, identity_nnz_end).
+///
+/// For non-sharded arrays each chunk is one file, so we copy any chunk
+/// fully within the identity range. For sharded arrays each storage key
+/// covers `shard_size` elements; we only copy when the whole shard is
+/// within the identity range to avoid conflicts with store_array_subset.
 fn passthrough_1d_chunks<S>(
     src: &Array<S>,
     dst: &Array<S>,
@@ -289,23 +293,26 @@ where
         return Ok(0);
     }
 
-    // Verify matching chunk sizes
-    let src_cs = src.chunk_shape(&vec![0u64])?.iter().map(|s| s.get()).next().unwrap_or(0);
-    let dst_cs = dst.chunk_shape(&vec![0u64])?.iter().map(|s| s.get()).next().unwrap_or(0);
+    let src_cs = src.chunk_shape(&[0u64])?.iter().map(|s| s.get()).next().unwrap_or(0);
+    let dst_cs = dst.chunk_shape(&[0u64])?.iter().map(|s| s.get()).next().unwrap_or(0);
 
     if src_cs != dst_cs || src_cs == 0 {
         return Ok(0);
     }
 
+    // chunk_size here is the outer grid unit -- for sharded arrays this is
+    // the shard size, so one retrieve_encoded_chunk / store_encoded_chunk
+    // touches exactly one storage key with no overlap.
     let chunk_size = src_cs as usize;
     let mut copied = 0usize;
 
     let n_src_chunks = src_grid[0];
-    for chunk_idx in 0..n_src_chunks {
+    let n_dst_chunks = dst_grid[0];
+
+    for chunk_idx in 0..n_src_chunks.min(n_dst_chunks) {
         let chunk_start = chunk_idx as usize * chunk_size;
         let chunk_end = chunk_start + chunk_size;
 
-        // Only copy chunks fully within the identity range
         if chunk_end > identity_nnz_end {
             break;
         }
@@ -322,6 +329,10 @@ where
         }
     }
 
+    log::debug!(
+        "passthrough_1d_chunks: copied {} of {} chunks (identity_nnz={})",
+        copied, n_src_chunks, identity_nnz_end
+    );
     Ok(copied)
 }
 

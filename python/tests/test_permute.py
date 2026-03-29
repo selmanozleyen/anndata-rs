@@ -594,3 +594,104 @@ class TestSplit:
             np.testing.assert_allclose(
                 result.obs["score"].values, expected_scores, atol=1e-6,
             )
+
+
+class TestPassthrough:
+    """Verify chunk passthrough fires for truncation (identity prefix)."""
+
+    def _read_shard_bytes(self, zarr_path, array_name="X"):
+        """Read raw shard/chunk files and return dict {filename: bytes}."""
+        import glob
+        arr_dir = os.path.join(zarr_path, array_name, "c")
+        result = {}
+        for f in glob.glob(os.path.join(arr_dir, "**", "*"), recursive=True):
+            if os.path.isfile(f):
+                rel = os.path.relpath(f, arr_dir)
+                with open(f, "rb") as fh:
+                    result[rel] = fh.read()
+        return result
+
+    def test_truncation_dense_bitwise_identical(self, zarr_pair):
+        """Truncating a dense array should produce bit-identical chunks."""
+        src, dst = zarr_pair
+        np.random.seed(200)
+        n_obs, n_vars = 2000, 50
+        X = np.random.randn(n_obs, n_vars).astype(np.float32)
+        _make_adata(src, X)
+
+        n_keep = 1500
+        perm = np.arange(n_keep, dtype=np.int64)
+        anndata_rs.permute(src, dst, perm)
+
+        result = ad.read_zarr(dst)
+        np.testing.assert_allclose(result.X, X[:n_keep], atol=1e-6)
+
+        src_shards = self._read_shard_bytes(src)
+        dst_shards = self._read_shard_bytes(dst)
+
+        shared_keys = set(src_shards.keys()) & set(dst_shards.keys())
+        assert len(shared_keys) > 0, "No shared shard files found"
+
+        identical = sum(
+            1 for k in shared_keys if src_shards[k] == dst_shards[k]
+        )
+        assert identical > 0, (
+            f"No bit-identical shards found among {len(shared_keys)} shared keys. "
+            f"Passthrough did not fire for truncation."
+        )
+
+    def test_truncation_sparse_bitwise_identical(self, zarr_pair):
+        """Truncating a sparse CSR array should produce bit-identical chunks."""
+        src, dst = zarr_pair
+        np.random.seed(201)
+        n_obs, n_vars = 2000, 50
+        dense = np.random.randn(n_obs, n_vars).astype(np.float32)
+        dense[dense < 0.5] = 0
+        X = csr_matrix(dense)
+        _make_adata(src, X)
+
+        n_keep = 1500
+        perm = np.arange(n_keep, dtype=np.int64)
+        anndata_rs.permute(src, dst, perm)
+
+        result = ad.read_zarr(dst)
+        actual = result.X.toarray() if issparse(result.X) else result.X
+        np.testing.assert_allclose(actual, dense[:n_keep], atol=1e-6)
+
+        src_data_shards = self._read_shard_bytes(src, "X/data")
+        dst_data_shards = self._read_shard_bytes(dst, "X/data")
+
+        shared = set(src_data_shards.keys()) & set(dst_data_shards.keys())
+        if len(shared) > 0:
+            identical = sum(
+                1 for k in shared if src_data_shards[k] == dst_data_shards[k]
+            )
+            assert identical > 0, (
+                f"No bit-identical data shards among {len(shared)} shared keys."
+            )
+
+    def test_shuffle_no_passthrough(self, zarr_pair):
+        """A random shuffle should NOT produce bit-identical chunks."""
+        src, dst = zarr_pair
+        np.random.seed(202)
+        n_obs, n_vars = 2000, 50
+        X = np.random.randn(n_obs, n_vars).astype(np.float32)
+        _make_adata(src, X)
+
+        perm = np.random.permutation(n_obs).astype(np.int64)
+        anndata_rs.permute(src, dst, perm)
+
+        result = ad.read_zarr(dst)
+        np.testing.assert_allclose(result.X, X[perm], atol=1e-6)
+
+        src_shards = self._read_shard_bytes(src)
+        dst_shards = self._read_shard_bytes(dst)
+
+        shared_keys = set(src_shards.keys()) & set(dst_shards.keys())
+        identical = sum(
+            1 for k in shared_keys if src_shards[k] == dst_shards[k]
+        )
+        assert identical == 0, (
+            f"Found {identical} bit-identical shards in a random shuffle -- "
+            f"passthrough should not fire."
+        )
