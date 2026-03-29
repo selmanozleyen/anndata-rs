@@ -51,6 +51,7 @@ pub struct OutputStoreConfig {
 /// var, uns, varm, varp unchanged. obs is NOT handled here -- the caller
 /// (Python) writes obs DataFrames directly, since pandas handles categoricals,
 /// nullable dtypes, etc. natively.
+///
 pub fn scatter_anndata(
     src_path: &Path,
     outputs: &[OutputStoreConfig],
