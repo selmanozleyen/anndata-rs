@@ -5,6 +5,7 @@ use anyhow::Result;
 
 #[pyfunction]
 #[pyo3(
+    name = "_scatter",
     signature = (input, outputs, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None, compression_level=None),
     text_signature = "(input, outputs, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None, compression_level=None)",
 )]
