@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -6,7 +7,7 @@ use zarrs::array::{Array, ArrayBytes, ArraySubset};
 use zarrs::storage::ReadableWritableListableStorageTraits;
 
 use crate::budget::BufferPool;
-use crate::scatter::{RowAssignment, ScatterPlanner, SparseScatterPass};
+use crate::scatter::{RowAssignment, ScatterPlanner, SparseScatterPass, SparseScatterEntry};
 
 /// Per-store CSR arrays and indptr for the scatter engine.
 pub struct SparseStoreArrays<'a, S: ?Sized> {
@@ -17,9 +18,11 @@ pub struct SparseStoreArrays<'a, S: ?Sized> {
 
 /// Out-of-core CSR sparse data/indices scatterer supporting multiple outputs.
 ///
-/// Uses chunk-aligned writes: plans by destination NNZ chunks, accumulates
-/// full chunk buffers, and writes each chunk exactly once via `store_chunk`
-/// (no read-modify-write overhead).
+/// Uses chunk-aligned writes with streaming flush: source chunks are decoded
+/// in parallel and their rows are scattered directly into pre-allocated
+/// destination chunk buffers. As soon as a destination chunk receives all
+/// its expected rows, the decoding thread flushes it immediately -- reads
+/// and writes overlap with no barrier.
 pub struct SparseScatterer {
     pool: BufferPool,
 }
@@ -29,12 +32,6 @@ impl SparseScatterer {
         Self { pool }
     }
 
-    /// Scatter CSR data/indices from one source into multiple destinations.
-    ///
-    /// `assignments` maps source rows to (store_id, output_row).
-    /// `stores[i]` holds the destination arrays and indptr for store i.
-    /// `src_indptr` is the full source indptr (already in memory).
-    /// `passthrough_possible` indicates src and dst share chunk/codec config.
     pub fn scatter_data_indices<S>(
         &self,
         src_indices: &Array<S>,
@@ -55,8 +52,6 @@ impl SparseScatterer {
 
         let headroom = 8 * 1024 * 1024;
         let available = self.pool.budget().available().saturating_sub(headroom);
-        // Each NNZ needs bytes_per_nnz for both read buffer and write buffer,
-        // so budget is halved between source reads and destination chunk buffers
         let max_nnz_per_pass = if bytes_per_nnz > 0 {
             (available / bytes_per_nnz / 2).max(4096)
         } else {
@@ -68,9 +63,7 @@ impl SparseScatterer {
             .collect();
 
         let store_nnz_chunk_sizes: Vec<usize> = stores.iter()
-            .map(|s| {
-                get_chunk_size_1d(s.dst_data)
-            })
+            .map(|s| get_chunk_size_1d(s.dst_data))
             .collect();
 
         let passes = ScatterPlanner::plan_sparse(
@@ -81,7 +74,7 @@ impl SparseScatterer {
         );
 
         log::info!(
-            "SparseScatterer: {} assignments, {} passes (chunk-aligned), max_nnz/pass={}",
+            "SparseScatterer: {} assignments, {} passes (streaming), max_nnz/pass={}",
             assignments.len(), passes.len(), max_nnz_per_pass
         );
 
@@ -91,7 +84,7 @@ impl SparseScatterer {
                 pass_idx + 1, passes.len(), pass.chunks.len(), pass.total_nnz
             );
 
-            self.process_pass(
+            self.process_pass_streaming(
                 src_data, src_indices, stores,
                 pass, src_indptr,
                 data_elem_size, indices_elem_size,
@@ -101,9 +94,9 @@ impl SparseScatterer {
         Ok(())
     }
 
-    /// Process one pass: read source data, assemble destination chunk buffers,
-    /// write whole chunks.
-    fn process_pass<S>(
+    /// Streaming pass: decode source chunks in parallel, scatter rows directly
+    /// into destination chunk buffers, flush each buffer the moment it is complete.
+    fn process_pass_streaming<S>(
         &self,
         src_data: &Array<S>,
         src_indices: &Array<S>,
@@ -116,45 +109,36 @@ impl SparseScatterer {
     where
         S: ReadableWritableListableStorageTraits + ?Sized + 'static,
     {
-        // Phase 1: collect all source rows needed for this pass and read them
-        let row_map = self.read_pass_sources(
-            src_data, src_indices, pass, src_indptr,
-            data_elem_size, indices_elem_size,
-        )?;
+        let dst_bufs: Vec<DstChunkBuf> = pass.chunks.iter().map(|sc| {
+            let chunk_nnz = sc.nnz_end - sc.nnz_start;
+            DstChunkBuf {
+                store_id: sc.store_id,
+                nnz_start: sc.nnz_start,
+                nnz_end: sc.nnz_end,
+                data_buf: vec![0u8; chunk_nnz * data_elem_size],
+                indices_buf: vec![0u8; chunk_nnz * indices_elem_size],
+                remaining: AtomicUsize::new(sc.entries.len()),
+                flushed: AtomicUsize::new(0),
+            }
+        }).collect();
 
-        // Phase 2: assemble destination chunk buffers and write whole chunks
-        self.write_pass_chunks(
-            stores, pass, &row_map, src_indptr,
-            data_elem_size, indices_elem_size,
-        )?;
+        // Build a lookup: source_row -> list of (dst_chunk_idx, entry)
+        // so that when we decode a source row, we know which dst buffers to fill.
+        let mut src_to_dst: std::collections::HashMap<usize, Vec<(usize, SparseScatterEntry)>> =
+            std::collections::HashMap::new();
+        for (chunk_idx, sc) in pass.chunks.iter().enumerate() {
+            for entry in &sc.entries {
+                src_to_dst
+                    .entry(entry.source_row)
+                    .or_default()
+                    .push((chunk_idx, *entry));
+            }
+        }
 
-        Ok(())
-    }
-
-    /// Read all source rows needed by this pass, returning a map of
-    /// source_row -> (data_bytes, indices_bytes).
-    fn read_pass_sources<S>(
-        &self,
-        src_data: &Array<S>,
-        src_indices: &Array<S>,
-        pass: &SparseScatterPass,
-        src_indptr: &[i64],
-        data_elem_size: usize,
-        indices_elem_size: usize,
-    ) -> Result<std::collections::HashMap<usize, (Vec<u8>, Vec<u8>)>>
-    where
-        S: ReadableWritableListableStorageTraits + ?Sized + 'static,
-    {
-        // Collect unique source rows across all chunks in this pass
-        let mut source_rows: Vec<usize> = pass.chunks.iter()
-            .flat_map(|c| c.entries.iter().map(|e| e.source_row))
-            .collect();
+        // Collect unique source rows, build merged read runs
+        let mut source_rows: Vec<usize> = src_to_dst.keys().copied().collect();
         source_rows.sort_unstable();
-        source_rows.dedup();
 
-        let capacity = source_rows.len();
-
-        // Build RowAssignment-like structs for merge_sparse_reads
         let fake_assigns: Vec<RowAssignment> = source_rows.iter()
             .map(|&src_row| RowAssignment {
                 source_row: src_row,
@@ -165,14 +149,13 @@ impl SparseScatterer {
         let assign_refs: Vec<&RowAssignment> = fake_assigns.iter().collect();
 
         let merged = merge_sparse_reads(&assign_refs, src_indptr, 8192);
-
         let src_chunk_size = get_chunk_size_1d(src_data);
         let sub_runs = split_merged_runs_by_chunk(&merged, src_indptr, src_chunk_size);
 
-        let map = Mutex::new(
-            std::collections::HashMap::<usize, (Vec<u8>, Vec<u8>)>::with_capacity(capacity),
-        );
+        // Collect flush errors
+        let flush_errors: Mutex<Vec<anyhow::Error>> = Mutex::new(Vec::new());
 
+        // -- Stream: decode sub-runs in parallel, scatter + flush --
         sub_runs.par_iter().try_for_each(|sub| -> Result<()> {
             if sub.nnz_end <= sub.nnz_start {
                 return Ok(());
@@ -189,126 +172,156 @@ impl SparseScatterer {
                 src_indices.retrieve_array_subset(&subset)?;
             let indices_raw = indices_bytes.into_fixed()?.into_owned();
 
-            let mut local: Vec<(usize, Vec<u8>, Vec<u8>)> =
-                Vec::with_capacity(sub.assignments.len());
-
             for a in &sub.assignments {
                 let lo = src_indptr[a.source_row] as usize;
                 let hi = src_indptr[a.source_row + 1] as usize;
                 if hi <= lo {
+                    // Still decrement counters for zero-nnz rows
+                    if let Some(targets) = src_to_dst.get(&a.source_row) {
+                        for &(chunk_idx, _) in targets {
+                            let buf = &dst_bufs[chunk_idx];
+                            let prev = buf.remaining.fetch_sub(1, Ordering::AcqRel);
+                            if prev == 1 {
+                                if let Err(e) = flush_chunk(
+                                    buf, stores, data_elem_size, indices_elem_size,
+                                ) {
+                                    flush_errors.lock().unwrap().push(e);
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
+
                 let rel_lo = lo - sub.nnz_start;
                 let rel_hi = hi - sub.nnz_start;
+                let src_data_slice =
+                    &data_raw[rel_lo * data_elem_size..rel_hi * data_elem_size];
+                let src_idx_slice =
+                    &indices_raw[rel_lo * indices_elem_size..rel_hi * indices_elem_size];
+                let src_nnz = hi - lo;
 
-                let d = data_raw[rel_lo * data_elem_size..rel_hi * data_elem_size].to_vec();
-                let i = indices_raw[rel_lo * indices_elem_size..rel_hi * indices_elem_size].to_vec();
-                local.push((a.source_row, d, i));
-            }
+                if let Some(targets) = src_to_dst.get(&a.source_row) {
+                    for &(chunk_idx, ref entry) in targets {
+                        let buf = &dst_bufs[chunk_idx];
+                        let store = &stores[buf.store_id as usize];
+                        let out_indptr = &store.out_indptr;
 
-            let mut guard = map.lock().unwrap();
-            for (src_row, d, i) in local {
-                guard.insert(src_row, (d, i));
+                        let row_nnz_start = out_indptr[entry.output_row] as usize;
+                        let row_nnz_end = out_indptr[entry.output_row + 1] as usize;
+                        let row_nnz = row_nnz_end - row_nnz_start;
+
+                        if row_nnz > 0 {
+                            let offset_in_chunk = row_nnz_start - buf.nnz_start;
+                            let copy_nnz = src_nnz.min(row_nnz);
+
+                            let dst_data_start = offset_in_chunk * data_elem_size;
+                            let src_data_len = copy_nnz * data_elem_size;
+
+                            // Safety: each entry targets a unique output_row within
+                            // this chunk, so different entries write to disjoint
+                            // byte ranges of the buffer. The atomic counter ensures
+                            // the buffer is not read for flushing until all writes
+                            // are complete.
+                            unsafe {
+                                let data_ptr = buf.data_buf.as_ptr() as *mut u8;
+                                std::ptr::copy_nonoverlapping(
+                                    src_data_slice.as_ptr(),
+                                    data_ptr.add(dst_data_start),
+                                    src_data_len,
+                                );
+
+                                let idx_ptr = buf.indices_buf.as_ptr() as *mut u8;
+                                let dst_idx_start = offset_in_chunk * indices_elem_size;
+                                let src_idx_len = copy_nnz * indices_elem_size;
+                                std::ptr::copy_nonoverlapping(
+                                    src_idx_slice.as_ptr(),
+                                    idx_ptr.add(dst_idx_start),
+                                    src_idx_len,
+                                );
+                            }
+                        }
+
+                        let prev = buf.remaining.fetch_sub(1, Ordering::AcqRel);
+                        if prev == 1 {
+                            if let Err(e) = flush_chunk(
+                                buf, stores, data_elem_size, indices_elem_size,
+                            ) {
+                                flush_errors.lock().unwrap().push(e);
+                            }
+                        }
+                    }
+                }
             }
             Ok(())
         })?;
 
-        Ok(map.into_inner().unwrap())
+        // Check for flush errors
+        let errors = flush_errors.into_inner().unwrap();
+        if let Some(e) = errors.into_iter().next() {
+            return Err(e);
+        }
+
+        // Flush any dst chunks that were never triggered (shouldn't happen
+        // if the planner is correct, but safety net)
+        for buf in &dst_bufs {
+            if buf.flushed.load(Ordering::Acquire) == 0
+                && buf.remaining.load(Ordering::Acquire) == 0
+                && (buf.nnz_end > buf.nnz_start)
+            {
+                flush_chunk(buf, stores, data_elem_size, indices_elem_size)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Flush a completed destination chunk buffer to disk.
+fn flush_chunk<S>(
+    buf: &DstChunkBuf,
+    stores: &[SparseStoreArrays<'_, S>],
+    _data_elem_size: usize,
+    _indices_elem_size: usize,
+) -> Result<()>
+where
+    S: ReadableWritableListableStorageTraits + ?Sized + 'static,
+{
+    buf.flushed.store(1, Ordering::Release);
+
+    let chunk_nnz = buf.nnz_end - buf.nnz_start;
+    if chunk_nnz == 0 {
+        return Ok(());
     }
 
-    /// Assemble and write whole destination chunks in parallel.
-    fn write_pass_chunks<S>(
-        &self,
-        stores: &[SparseStoreArrays<'_, S>],
-        pass: &SparseScatterPass,
-        row_map: &std::collections::HashMap<usize, (Vec<u8>, Vec<u8>)>,
-        src_indptr: &[i64],
-        data_elem_size: usize,
-        indices_elem_size: usize,
-    ) -> Result<()>
-    where
-        S: ReadableWritableListableStorageTraits + ?Sized + 'static,
-    {
-        pass.chunks.par_iter().try_for_each(|sc| -> Result<()> {
-            let store = &stores[sc.store_id as usize];
-            let out_indptr = &store.out_indptr;
-            let chunk_nnz = sc.nnz_end - sc.nnz_start;
+    let store = &stores[buf.store_id as usize];
+    let write_subset = ArraySubset::new_with_ranges(
+        &[buf.nnz_start as u64..buf.nnz_end as u64],
+    );
 
-            if chunk_nnz == 0 {
-                return Ok(());
-            }
+    // Safety: we only reach here after all writers have finished (atomic
+    // counter hit zero with AcqRel ordering), so reading the buffers is safe.
+    store.dst_data.store_array_subset(
+        &write_subset,
+        ArrayBytes::from(buf.data_buf.as_slice()),
+    )?;
+    store.dst_indices.store_array_subset(
+        &write_subset,
+        ArrayBytes::from(buf.indices_buf.as_slice()),
+    )?;
 
-            let mut data_buf = vec![0u8; chunk_nnz * data_elem_size];
-            let mut indices_buf = vec![0u8; chunk_nnz * indices_elem_size];
+    Ok(())
+}
 
-            // Sort entries by output_row so we fill the buffer in order
-            let mut sorted_entries = sc.entries.clone();
-            sorted_entries.sort_unstable_by_key(|e| e.output_row);
-
-            for entry in &sorted_entries {
-                let row_nnz_start = out_indptr[entry.output_row] as usize;
-                let row_nnz_end = out_indptr[entry.output_row + 1] as usize;
-                let row_nnz = row_nnz_end - row_nnz_start;
-                if row_nnz == 0 {
-                    continue;
-                }
-
-                let offset_in_chunk = row_nnz_start - sc.nnz_start;
-
-                if let Some((d, i)) = row_map.get(&entry.source_row) {
-                    let src_nnz = (src_indptr[entry.source_row + 1]
-                        - src_indptr[entry.source_row]) as usize;
-                    let copy_nnz = src_nnz.min(row_nnz);
-
-                    let dst_data_start = offset_in_chunk * data_elem_size;
-                    let src_data_len = copy_nnz * data_elem_size;
-                    data_buf[dst_data_start..dst_data_start + src_data_len]
-                        .copy_from_slice(&d[..src_data_len]);
-
-                    let dst_idx_start = offset_in_chunk * indices_elem_size;
-                    let src_idx_len = copy_nnz * indices_elem_size;
-                    indices_buf[dst_idx_start..dst_idx_start + src_idx_len]
-                        .copy_from_slice(&i[..src_idx_len]);
-                }
-            }
-
-            let total_dst_nnz = *out_indptr.last().unwrap_or(&0) as usize;
-            let dst_data_chunk_size = get_chunk_size_1d(store.dst_data);
-            let is_full_chunk = (sc.nnz_end - sc.nnz_start) == dst_data_chunk_size
-                || sc.nnz_end == total_dst_nnz;
-
-            if is_full_chunk {
-                // Write the entire chunk at once -- store_array_subset on a
-                // chunk-aligned range is equivalent to store_chunk but does not
-                // require us to figure out the chunk index encoding.
-                let write_subset = ArraySubset::new_with_ranges(
-                    &[sc.nnz_start as u64..sc.nnz_end as u64],
-                );
-                store.dst_data.store_array_subset(
-                    &write_subset,
-                    ArrayBytes::from(data_buf),
-                )?;
-                store.dst_indices.store_array_subset(
-                    &write_subset,
-                    ArrayBytes::from(indices_buf),
-                )?;
-            } else {
-                let write_subset = ArraySubset::new_with_ranges(
-                    &[sc.nnz_start as u64..sc.nnz_end as u64],
-                );
-                store.dst_data.store_array_subset(
-                    &write_subset,
-                    ArrayBytes::from(data_buf),
-                )?;
-                store.dst_indices.store_array_subset(
-                    &write_subset,
-                    ArrayBytes::from(indices_buf),
-                )?;
-            }
-
-            Ok(())
-        })
-    }
+// Use the struct at module level so flush_chunk can reference it
+struct DstChunkBuf {
+    store_id: u16,
+    nnz_start: usize,
+    nnz_end: usize,
+    data_buf: Vec<u8>,
+    indices_buf: Vec<u8>,
+    remaining: AtomicUsize,
+    flushed: AtomicUsize,
 }
 
 /// Get the 1D chunk size for a zarrs Array, or usize::MAX if unknown.
