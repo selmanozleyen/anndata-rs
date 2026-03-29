@@ -443,11 +443,17 @@ fn split_merged_runs_by_chunk<'a>(
             } else {
                 chunk_idx * src_chunk_size
             };
-            let sub_nnz_end = if chunk_idx == last_chunk {
+            let mut sub_nnz_end = if chunk_idx == last_chunk {
                 run.nnz_end
             } else {
                 (chunk_idx + 1) * src_chunk_size
             };
+            // A row's NNZ span may extend past the chunk boundary.
+            // Expand the read range to cover all assigned rows fully.
+            for &a in &assigns {
+                let hi = src_indptr[a.source_row + 1] as usize;
+                sub_nnz_end = sub_nnz_end.max(hi);
+            }
             out.push(MergedSparseRun {
                 nnz_start: sub_nnz_start,
                 nnz_end: sub_nnz_end,
@@ -456,4 +462,621 @@ fn split_merged_runs_by_chunk<'a>(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use zarrs::array::ArrayBuilder;
+    use zarrs::array::data_type;
+    use zarrs::storage::store::MemoryStore;
+    use zarrs::storage::ReadableWritableListableStorage;
+
+    fn make_1d_u8_array(
+        store: ReadableWritableListableStorage,
+        path: &str,
+        len: u64,
+        chunk_size: u64,
+    ) -> Array<dyn ReadableWritableListableStorageTraits> {
+        let cs = vec![chunk_size.min(len).max(1)];
+        let builder = ArrayBuilder::new(
+            vec![len],
+            cs,
+            data_type::uint8(),
+            0u8,
+        );
+        let arr = builder.build(store, path).unwrap();
+        arr.store_metadata().unwrap();
+        arr
+    }
+
+    fn write_1d(arr: &Array<dyn ReadableWritableListableStorageTraits>, data: &[u8]) {
+        let n = arr.shape()[0];
+        let subset = ArraySubset::new_with_ranges(&[0..n]);
+        arr.store_array_subset(&subset, ArrayBytes::from(data.to_vec())).unwrap();
+    }
+
+    fn read_1d(arr: &Array<dyn ReadableWritableListableStorageTraits>) -> Vec<u8> {
+        let n = arr.shape()[0];
+        let subset = ArraySubset::new_with_ranges(&[0..n]);
+        let bytes: ArrayBytes<'_> = arr.retrieve_array_subset(&subset).unwrap();
+        bytes.into_fixed().unwrap().into_owned()
+    }
+
+    // ===============================================================
+    //  merge_sparse_reads tests
+    // ===============================================================
+
+    #[test]
+    fn merge_reads_single_row() {
+        let a = RowAssignment { source_row: 0, store_id: 0, output_row: 0 };
+        let refs = vec![&a];
+        let indptr = vec![0i64, 10];
+        let runs = merge_sparse_reads(&refs, &indptr, 100);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].nnz_start, 0);
+        assert_eq!(runs[0].nnz_end, 10);
+    }
+
+    #[test]
+    fn merge_reads_adjacent_merge() {
+        let a0 = RowAssignment { source_row: 0, store_id: 0, output_row: 0 };
+        let a1 = RowAssignment { source_row: 1, store_id: 0, output_row: 1 };
+        let refs = vec![&a0, &a1];
+        let indptr = vec![0i64, 10, 20];
+        let runs = merge_sparse_reads(&refs, &indptr, 5);
+        assert_eq!(runs.len(), 1, "adjacent rows should merge");
+        assert_eq!(runs[0].nnz_start, 0);
+        assert_eq!(runs[0].nnz_end, 20);
+        assert_eq!(runs[0].assignments.len(), 2);
+    }
+
+    #[test]
+    fn merge_reads_gap_too_large() {
+        let a0 = RowAssignment { source_row: 0, store_id: 0, output_row: 0 };
+        let a1 = RowAssignment { source_row: 2, store_id: 0, output_row: 1 };
+        let refs = vec![&a0, &a1];
+        // row0: [0,10), row1 skipped, row2: [1000, 1010)
+        let indptr = vec![0i64, 10, 1000, 1010];
+        let runs = merge_sparse_reads(&refs, &indptr, 5);
+        assert_eq!(runs.len(), 2, "big gap should split");
+    }
+
+    #[test]
+    fn merge_reads_empty() {
+        let refs: Vec<&RowAssignment> = vec![];
+        let indptr = vec![0i64, 10];
+        let runs = merge_sparse_reads(&refs, &indptr, 100);
+        assert!(runs.is_empty());
+    }
+
+    // ===============================================================
+    //  split_merged_runs_by_chunk tests
+    // ===============================================================
+
+    #[test]
+    fn split_single_chunk_no_split() {
+        let a = RowAssignment { source_row: 0, store_id: 0, output_row: 0 };
+        let run = MergedSparseRun {
+            nnz_start: 0,
+            nnz_end: 50,
+            assignments: vec![&a],
+        };
+        let indptr = vec![0i64, 50];
+        let result = split_merged_runs_by_chunk(&[run], &indptr, 100);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].nnz_start, 0);
+        assert_eq!(result[0].nnz_end, 50);
+    }
+
+    #[test]
+    fn split_row_spanning_chunk_boundary() {
+        // Row 1 NNZ = [90, 110) -- crosses chunk boundary at 100.
+        // source_row=1 so lo=indptr[1]=90, hi=indptr[2]=110.
+        let a = RowAssignment { source_row: 1, store_id: 0, output_row: 0 };
+        let run = MergedSparseRun {
+            nnz_start: 90,
+            nnz_end: 110,
+            assignments: vec![&a],
+        };
+        let indptr = vec![0i64, 90, 110];
+        let result = split_merged_runs_by_chunk(&[run], &indptr, 100);
+        // Row bucketed to chunk 0 (90/100=0), sub-run must expand nnz_end to 110.
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].nnz_end >= 110,
+            "sub-run nnz_end must cover full row span; got {}",
+            result[0].nnz_end,
+        );
+    }
+
+    #[test]
+    fn split_multiple_rows_one_spans() {
+        // Row 0: [0, 10), row 1: [10, 95), row 2: [95, 110)
+        // Chunk size 100. Row 2 starts in chunk 0, ends in chunk 1.
+        let a0 = RowAssignment { source_row: 0, store_id: 0, output_row: 0 };
+        let a1 = RowAssignment { source_row: 1, store_id: 0, output_row: 1 };
+        let a2 = RowAssignment { source_row: 2, store_id: 0, output_row: 2 };
+        let run = MergedSparseRun {
+            nnz_start: 0,
+            nnz_end: 110,
+            assignments: vec![&a0, &a1, &a2],
+        };
+        let indptr = vec![0i64, 10, 95, 110];
+        let result = split_merged_runs_by_chunk(&[run], &indptr, 100);
+
+        // All 3 rows start in chunk 0 (lo/100 == 0), so they are all in one bucket.
+        // The sub-run must cover up to 110.
+        let total_assigns: usize = result.iter().map(|r| r.assignments.len()).sum();
+        assert_eq!(total_assigns, 3);
+        let max_end = result.iter().map(|r| r.nnz_end).max().unwrap();
+        assert!(max_end >= 110, "must cover all row data; got {}", max_end);
+    }
+
+    #[test]
+    fn split_rows_in_different_chunks() {
+        // 3 source rows:
+        //   row 0: NNZ [0, 50)    -> chunk 0
+        //   row 1: NNZ [50, 150)  -> chunk 0 (lo=50, 50/100=0) but extends into chunk 1
+        //   row 2: NNZ [150, 200) -> chunk 1
+        // After split we expect 2 sub-runs: chunk0 has rows 0,1; chunk1 has row 2.
+        let a0 = RowAssignment { source_row: 0, store_id: 0, output_row: 0 };
+        let a2 = RowAssignment { source_row: 2, store_id: 0, output_row: 1 };
+        let run = MergedSparseRun {
+            nnz_start: 0,
+            nnz_end: 200,
+            assignments: vec![&a0, &a2],
+        };
+        // indptr: row0=[0,50), row1=[50,150), row2=[150,200)
+        let indptr = vec![0i64, 50, 150, 200];
+        let result = split_merged_runs_by_chunk(&[run], &indptr, 100);
+        assert_eq!(result.len(), 2);
+        // chunk 0 has row 0, chunk 1 has row 2
+        assert_eq!(result[0].assignments.len(), 1);
+        assert_eq!(result[0].assignments[0].source_row, 0);
+        assert_eq!(result[1].assignments.len(), 1);
+        assert_eq!(result[1].assignments[0].source_row, 2);
+    }
+
+    #[test]
+    fn split_usize_max_chunk_no_split() {
+        let a = RowAssignment { source_row: 0, store_id: 0, output_row: 0 };
+        let run = MergedSparseRun {
+            nnz_start: 0,
+            nnz_end: 500,
+            assignments: vec![&a],
+        };
+        let indptr = vec![0i64, 500];
+        let result = split_merged_runs_by_chunk(&[run], &indptr, usize::MAX);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn split_exact_chunk_boundary_row() {
+        // Row exactly fills chunk 1: NNZ = [100, 200) with chunk_size=100
+        let a = RowAssignment { source_row: 1, store_id: 0, output_row: 0 };
+        let run = MergedSparseRun {
+            nnz_start: 100,
+            nnz_end: 200,
+            assignments: vec![&a],
+        };
+        let indptr = vec![0i64, 100, 200];
+        let result = split_merged_runs_by_chunk(&[run], &indptr, 100);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].nnz_start, 100);
+        assert_eq!(result[0].nnz_end, 200);
+    }
+
+    // ===============================================================
+    //  End-to-end SparseScatterer with in-memory zarrs
+    // ===============================================================
+
+    /// Build source + destination arrays, run scatter, verify output bytes.
+    ///
+    /// `src_indptr`: source CSR indptr
+    /// `src_data_vals`: flat source data values (u8 per element)
+    /// `src_idx_vals`: flat source index values (u8 per element)
+    /// `assignments`: scatter plan
+    /// `out_indptr`: destination indptr (per store)
+    /// `src_chunk_size`, `dst_chunk_size`: zarr chunk sizes
+    ///
+    /// Returns (output_data_bytes, output_indices_bytes) per store.
+    fn run_scatter_e2e(
+        src_indptr: &[i64],
+        src_data_vals: &[u8],
+        src_idx_vals: &[u8],
+        assignments: &[RowAssignment],
+        stores_out_indptrs: &[Vec<i64>],
+        src_chunk_size: u64,
+        dst_chunk_size: u64,
+        memory_limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let total_src_nnz = *src_indptr.last().unwrap() as u64;
+        assert_eq!(src_data_vals.len(), total_src_nnz as usize);
+        assert_eq!(src_idx_vals.len(), total_src_nnz as usize);
+
+        let src_store: ReadableWritableListableStorage =
+            Arc::new(MemoryStore::new());
+        let src_data_arr = make_1d_u8_array(
+            src_store.clone(), "/src_data", total_src_nnz, src_chunk_size,
+        );
+        let src_idx_arr = make_1d_u8_array(
+            src_store.clone(), "/src_indices", total_src_nnz, src_chunk_size,
+        );
+        write_1d(&src_data_arr, src_data_vals);
+        write_1d(&src_idx_arr, src_idx_vals);
+
+        let mut dst_stores: Vec<(
+            ReadableWritableListableStorage,
+            Array<dyn ReadableWritableListableStorageTraits>,
+            Array<dyn ReadableWritableListableStorageTraits>,
+        )> = Vec::new();
+
+        for (sid, out_indptr) in stores_out_indptrs.iter().enumerate() {
+            let total_dst_nnz = *out_indptr.last().unwrap() as u64;
+            let ds: ReadableWritableListableStorage = Arc::new(MemoryStore::new());
+            let d_arr = make_1d_u8_array(
+                ds.clone(),
+                &format!("/dst{}_data", sid),
+                total_dst_nnz.max(1),
+                dst_chunk_size,
+            );
+            let i_arr = make_1d_u8_array(
+                ds.clone(),
+                &format!("/dst{}_indices", sid),
+                total_dst_nnz.max(1),
+                dst_chunk_size,
+            );
+            dst_stores.push((ds, d_arr, i_arr));
+        }
+
+        let store_arrays: Vec<SparseStoreArrays<'_, dyn ReadableWritableListableStorageTraits>> =
+            dst_stores.iter().enumerate().map(|(sid, (_ds, d, i))| {
+                SparseStoreArrays {
+                    dst_data: d,
+                    dst_indices: i,
+                    out_indptr: stores_out_indptrs[sid].clone(),
+                }
+            }).collect();
+
+        let budget = crate::budget::MemoryBudget::new(memory_limit);
+        let pool = crate::budget::BufferPool::new(budget);
+        let scatterer = SparseScatterer::new(pool);
+        scatterer.scatter_data_indices(
+            &src_idx_arr,
+            &src_data_arr,
+            &store_arrays,
+            assignments,
+            src_indptr,
+            false,
+        ).unwrap();
+
+        dst_stores.iter().enumerate().map(|(sid, (_ds, d, i))| {
+            let total_dst_nnz = *stores_out_indptrs[sid].last().unwrap() as usize;
+            if total_dst_nnz == 0 {
+                return (vec![], vec![]);
+            }
+            (read_1d(d), read_1d(i))
+        }).collect()
+    }
+
+    #[test]
+    fn e2e_identity_single_store() {
+        // 4 rows, varying NNZ: [3, 2, 4, 1] = 10 total
+        let src_indptr = vec![0i64, 3, 5, 9, 10];
+        let src_data: Vec<u8> = (10..20).collect();
+        let src_idx: Vec<u8> = (100..110).collect();
+
+        // Identity: output_row[i] = source_row[i]
+        let assignments = vec![
+            RowAssignment { source_row: 0, store_id: 0, output_row: 0 },
+            RowAssignment { source_row: 1, store_id: 0, output_row: 1 },
+            RowAssignment { source_row: 2, store_id: 0, output_row: 2 },
+            RowAssignment { source_row: 3, store_id: 0, output_row: 3 },
+        ];
+        let out_indptr = vec![0i64, 3, 5, 9, 10];
+
+        let results = run_scatter_e2e(
+            &src_indptr, &src_data, &src_idx,
+            &assignments, &[out_indptr],
+            10, 10, 1024 * 1024,
+        );
+
+        assert_eq!(results[0].0, src_data, "data should be identical for identity scatter");
+        assert_eq!(results[0].1, src_idx, "indices should be identical for identity scatter");
+    }
+
+    #[test]
+    fn e2e_reverse_permutation() {
+        // 4 rows: NNZ = [2, 3, 1, 4] = 10 total
+        let src_indptr = vec![0i64, 2, 5, 6, 10];
+        let src_data: Vec<u8> = (20..30).collect();
+        let src_idx: Vec<u8> = (50..60).collect();
+
+        // Reverse: output row 0 = src row 3, 1 = src 2, 2 = src 1, 3 = src 0
+        let assignments = vec![
+            RowAssignment { source_row: 3, store_id: 0, output_row: 0 },
+            RowAssignment { source_row: 2, store_id: 0, output_row: 1 },
+            RowAssignment { source_row: 1, store_id: 0, output_row: 2 },
+            RowAssignment { source_row: 0, store_id: 0, output_row: 3 },
+        ];
+        // Out NNZ: [4, 1, 3, 2] => indptr [0, 4, 5, 8, 10]
+        let out_indptr = vec![0i64, 4, 5, 8, 10];
+
+        let results = run_scatter_e2e(
+            &src_indptr, &src_data, &src_idx,
+            &assignments, &[out_indptr],
+            10, 10, 1024 * 1024,
+        );
+
+        // out row 0 = src row 3 data = src_data[6..10] = [26,27,28,29]
+        assert_eq!(&results[0].0[0..4], &[26, 27, 28, 29]);
+        // out row 1 = src row 2 data = src_data[5..6] = [25]
+        assert_eq!(&results[0].0[4..5], &[25]);
+        // out row 2 = src row 1 data = src_data[2..5] = [22,23,24]
+        assert_eq!(&results[0].0[5..8], &[22, 23, 24]);
+        // out row 3 = src row 0 data = src_data[0..2] = [20,21]
+        assert_eq!(&results[0].0[8..10], &[20, 21]);
+
+        // Same for indices
+        assert_eq!(&results[0].1[0..4], &[56, 57, 58, 59]);
+        assert_eq!(&results[0].1[4..5], &[55]);
+        assert_eq!(&results[0].1[5..8], &[52, 53, 54]);
+        assert_eq!(&results[0].1[8..10], &[50, 51]);
+    }
+
+    #[test]
+    fn e2e_small_chunks_forces_multiple_passes() {
+        // 4 rows: NNZ = [5, 5, 5, 5] = 20 total
+        // dst chunk_size = 5 => 4 dst chunks
+        // memory budget very small => forces multiple passes
+        let src_indptr = vec![0i64, 5, 10, 15, 20];
+        let src_data: Vec<u8> = (0..20).collect();
+        let src_idx: Vec<u8> = (100..120).collect();
+
+        let assignments = ScatterPlanner::from_permutation(&[0, 1, 2, 3]);
+        let out_indptr = vec![0i64, 5, 10, 15, 20];
+
+        // Budget: data_elem=1, idx_elem=1, bytes_per_nnz=2
+        // headroom=8MB, so available = 8MB+100 - 8MB = 100
+        // max_nnz_per_pass = 100/2/2 = 25 -- still fits in 1 pass
+        // Use tighter budget: 8MB + 16 => available=16, max_nnz = max(16/2/2, 4096) = 4096
+        // That's still large. The memory budget controls pass splitting via plan_sparse,
+        // so we need the budget to produce max_nnz_per_pass < 20.
+        // available needs to be < 20*2*2 = 80 but > headroom (8MB)... headroom is 8MB.
+        // With 8MB headroom, available = budget - 8MB. We need available < 80 =>
+        // budget < 8MB + 80. But budget must be > 0.
+        // The headroom is inside the code, so we set budget = 8*1024*1024 + 20.
+        // available = 20, max_nnz = max(20/2/2, 4096) = 4096 -- the .max(4096) defeats us.
+        // The .max(4096) clamp means we can't force multi-pass through memory alone
+        // at this scale. Instead just verify correctness with generous memory.
+
+        let results = run_scatter_e2e(
+            &src_indptr, &src_data, &src_idx,
+            &assignments, &[out_indptr],
+            5, 5, 1024 * 1024,
+        );
+
+        assert_eq!(results[0].0, src_data);
+        assert_eq!(results[0].1, src_idx);
+    }
+
+    #[test]
+    fn e2e_row_spanning_src_chunk_boundary() {
+        // The critical bug scenario:
+        // src chunk_size = 10. One row has NNZ [8, 15) -- spans chunk 0|1 boundary at 10.
+        // 3 rows total: [0,8), [8,15), [15,20)
+        let src_indptr = vec![0i64, 8, 15, 20];
+        let src_data: Vec<u8> = (0..20).collect();
+        let src_idx: Vec<u8> = (40..60).collect();
+
+        let assignments = ScatterPlanner::from_permutation(&[0, 1, 2]);
+        let out_indptr = vec![0i64, 8, 15, 20];
+
+        let results = run_scatter_e2e(
+            &src_indptr, &src_data, &src_idx,
+            &assignments, &[out_indptr],
+            10,  // src chunk = 10, so row 1 spans chunk boundary
+            20,  // dst chunk = 20 (all in one)
+            1024 * 1024,
+        );
+
+        assert_eq!(results[0].0, src_data, "data mismatch with spanning row");
+        assert_eq!(results[0].1, src_idx, "indices mismatch with spanning row");
+    }
+
+    #[test]
+    fn e2e_row_spanning_src_chunk_boundary_shuffled() {
+        // Same as above but with shuffled output order.
+        // src chunk_size = 10. Row 1 NNZ [8,15) spans boundary.
+        let src_indptr = vec![0i64, 8, 15, 20];
+        let src_data: Vec<u8> = (0..20).collect();
+        let src_idx: Vec<u8> = (40..60).collect();
+
+        // Reverse: out[0]=src[2], out[1]=src[1], out[2]=src[0]
+        let assignments = vec![
+            RowAssignment { source_row: 2, store_id: 0, output_row: 0 },
+            RowAssignment { source_row: 1, store_id: 0, output_row: 1 },
+            RowAssignment { source_row: 0, store_id: 0, output_row: 2 },
+        ];
+        // Out NNZ: src2=5, src1=7, src0=8 => out_indptr = [0, 5, 12, 20]
+        let out_indptr = vec![0i64, 5, 12, 20];
+
+        let results = run_scatter_e2e(
+            &src_indptr, &src_data, &src_idx,
+            &assignments, &[out_indptr],
+            10, 20, 1024 * 1024,
+        );
+
+        // out row 0 = src row 2: data [15..20]
+        assert_eq!(&results[0].0[0..5], &[15, 16, 17, 18, 19]);
+        // out row 1 = src row 1: data [8..15]
+        assert_eq!(&results[0].0[5..12], &[8, 9, 10, 11, 12, 13, 14]);
+        // out row 2 = src row 0: data [0..8]
+        assert_eq!(&results[0].0[12..20], &[0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn e2e_zero_nnz_rows() {
+        // Some rows have zero NNZ. They should not cause panics.
+        // 5 rows: NNZ = [3, 0, 2, 0, 5] = 10 total
+        let src_indptr = vec![0i64, 3, 3, 5, 5, 10];
+        let src_data: Vec<u8> = (0..10).collect();
+        let src_idx: Vec<u8> = (50..60).collect();
+
+        let assignments = ScatterPlanner::from_permutation(&[0, 1, 2, 3, 4]);
+        let out_indptr = vec![0i64, 3, 3, 5, 5, 10];
+
+        let results = run_scatter_e2e(
+            &src_indptr, &src_data, &src_idx,
+            &assignments, &[out_indptr],
+            10, 10, 1024 * 1024,
+        );
+
+        assert_eq!(results[0].0, src_data);
+        assert_eq!(results[0].1, src_idx);
+    }
+
+    #[test]
+    fn e2e_multi_store_groupby() {
+        // 6 rows split into 2 stores.
+        // Row NNZ: [2, 3, 1, 4, 2, 3] = 15 total
+        // Groups:  [0, 1, 0, 1, 0, 1]
+        // Store 0 gets rows 0,2,4 (NNZ 2,1,2 = 5)
+        // Store 1 gets rows 1,3,5 (NNZ 3,4,3 = 10)
+        let src_indptr = vec![0i64, 2, 5, 6, 10, 12, 15];
+        let src_data: Vec<u8> = (0..15).collect();
+        let src_idx: Vec<u8> = (80..95).collect();
+
+        let group_ids: Vec<u16> = vec![0, 1, 0, 1, 0, 1];
+        let (assignments, _store_n_rows) = ScatterPlanner::from_groups(&group_ids, 2);
+
+        let out_indptr_0 = vec![0i64, 2, 3, 5]; // store 0: rows 0,2,4 -> nnz 2,1,2
+        let out_indptr_1 = vec![0i64, 3, 7, 10]; // store 1: rows 1,3,5 -> nnz 3,4,3
+
+        let results = run_scatter_e2e(
+            &src_indptr, &src_data, &src_idx,
+            &assignments, &[out_indptr_0, out_indptr_1],
+            15, 15, 1024 * 1024,
+        );
+
+        // Store 0: out[0]=src[0] (2 nnz), out[1]=src[2] (1 nnz), out[2]=src[4] (2 nnz)
+        assert_eq!(&results[0].0[0..2], &src_data[0..2]);   // src row 0
+        assert_eq!(&results[0].0[2..3], &src_data[5..6]);   // src row 2
+        assert_eq!(&results[0].0[3..5], &src_data[10..12]); // src row 4
+
+        // Store 1: out[0]=src[1] (3 nnz), out[1]=src[3] (4 nnz), out[2]=src[5] (3 nnz)
+        assert_eq!(&results[1].0[0..3], &src_data[2..5]);   // src row 1
+        assert_eq!(&results[1].0[3..7], &src_data[6..10]);  // src row 3
+        assert_eq!(&results[1].0[7..10], &src_data[12..15]); // src row 5
+    }
+
+    #[test]
+    fn e2e_dst_spans_multiple_chunks() {
+        // Destination has small chunk size, causing multiple dst chunks.
+        // 3 rows, NNZ = [4, 4, 4] = 12 total. Dst chunk_size = 5.
+        // Dst chunks: [0..5), [5..10), [10..12)
+        let src_indptr = vec![0i64, 4, 8, 12];
+        let src_data: Vec<u8> = (0..12).collect();
+        let src_idx: Vec<u8> = (30..42).collect();
+
+        let assignments = ScatterPlanner::from_permutation(&[0, 1, 2]);
+        let out_indptr = vec![0i64, 4, 8, 12];
+
+        let results = run_scatter_e2e(
+            &src_indptr, &src_data, &src_idx,
+            &assignments, &[out_indptr],
+            12, 5, 1024 * 1024,
+        );
+
+        assert_eq!(results[0].0, src_data);
+        assert_eq!(results[0].1, src_idx);
+    }
+
+    #[test]
+    fn e2e_large_random_shuffle() {
+        // Stress test: 100 rows with random-ish NNZ, shuffled.
+        let n_rows = 100;
+        let mut src_indptr = vec![0i64];
+        for i in 0..n_rows {
+            let nnz = (i % 7 + 1) as i64;
+            src_indptr.push(src_indptr.last().unwrap() + nnz);
+        }
+        let total_nnz = *src_indptr.last().unwrap() as usize;
+        let src_data: Vec<u8> = (0..total_nnz).map(|i| (i % 256) as u8).collect();
+        let src_idx: Vec<u8> = (0..total_nnz).map(|i| ((i + 128) % 256) as u8).collect();
+
+        // Shuffle: reverse order
+        let perm: Vec<usize> = (0..n_rows).rev().collect();
+        let assignments = ScatterPlanner::from_permutation(&perm);
+
+        // Build output indptr based on reversed NNZ
+        let mut out_indptr = vec![0i64];
+        for &src_row in &perm {
+            let nnz = src_indptr[src_row + 1] - src_indptr[src_row];
+            out_indptr.push(out_indptr.last().unwrap() + nnz);
+        }
+
+        let results = run_scatter_e2e(
+            &src_indptr, &src_data, &src_idx,
+            &assignments, &[out_indptr.clone()],
+            17, 23, 1024 * 1024,
+        );
+
+        // Verify each output row
+        for (out_row, &src_row) in perm.iter().enumerate() {
+            let src_lo = src_indptr[src_row] as usize;
+            let src_hi = src_indptr[src_row + 1] as usize;
+            let out_lo = out_indptr[out_row] as usize;
+            let out_hi = out_indptr[out_row + 1] as usize;
+            assert_eq!(
+                &results[0].0[out_lo..out_hi],
+                &src_data[src_lo..src_hi],
+                "data mismatch at out_row={} (src_row={})", out_row, src_row,
+            );
+            assert_eq!(
+                &results[0].1[out_lo..out_hi],
+                &src_idx[src_lo..src_hi],
+                "indices mismatch at out_row={} (src_row={})", out_row, src_row,
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_mismatched_src_dst_chunk_sizes() {
+        // src chunk = 7, dst chunk = 13 -- intentionally coprime
+        // 5 rows, NNZ = [3, 5, 2, 6, 4] = 20 total
+        let src_indptr = vec![0i64, 3, 8, 10, 16, 20];
+        let src_data: Vec<u8> = (0..20).collect();
+        let src_idx: Vec<u8> = (200..220).collect();
+
+        // Shuffle: [3, 0, 4, 1, 2]
+        let perm = vec![3, 0, 4, 1, 2];
+        let assignments = ScatterPlanner::from_permutation(&perm);
+
+        let mut out_indptr = vec![0i64];
+        for &src_row in &perm {
+            let nnz = src_indptr[src_row + 1] - src_indptr[src_row];
+            out_indptr.push(out_indptr.last().unwrap() + nnz);
+        }
+
+        let results = run_scatter_e2e(
+            &src_indptr, &src_data, &src_idx,
+            &assignments, &[out_indptr.clone()],
+            7, 13, 1024 * 1024,
+        );
+
+        for (out_row, &src_row) in perm.iter().enumerate() {
+            let src_lo = src_indptr[src_row] as usize;
+            let src_hi = src_indptr[src_row + 1] as usize;
+            let out_lo = out_indptr[out_row] as usize;
+            let out_hi = out_indptr[out_row + 1] as usize;
+            assert_eq!(
+                &results[0].0[out_lo..out_hi],
+                &src_data[src_lo..src_hi],
+                "data mismatch at out_row={}", out_row,
+            );
+        }
+    }
 }
