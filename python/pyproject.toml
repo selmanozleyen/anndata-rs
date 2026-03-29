@@ -3,15 +3,13 @@ requires = ["maturin>=1.4,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
+# Only scatter engine by default (no polars, fast compile).
+# To build with full anndata support: change features to ["extension-module", "full"]
 features = ["extension-module"]
+no-default-features = true
 module-name = "anndata_rs.anndata_rs"
 python-source = "."
 build-dir = "build"
-
-# To build without polars (scatter-only, fast compile):
-#   maturin develop --no-default-features --features extension-module
-# To build with everything (default):
-#   maturin develop
 
 [project]
 name = "anndata_rs"
@@ -32,14 +30,16 @@ requires-python = ">=3.8, <3.14"
 dynamic = ["version"]
 
 dependencies = [
-    'anndata >= 0.8.0, < 0.13.0',
-    'hdf5plugin >= 5.0.0',
     "numpy>=2, <3",
-    "pandas>=2.2, <3",
-    "pyarrow",
     "scipy>=1.4",
-    "polars>=1.9, <1.32",
 ]
 
 [project.optional-dependencies]
+full = [
+    'anndata >= 0.8.0, < 0.13.0',
+    'hdf5plugin >= 5.0.0',
+    "pandas>=2.2, <3",
+    "pyarrow",
+    "polars>=1.9, <1.32",
+]
 test = ["pytest", "hypothesis==6.72.4"]
