@@ -92,17 +92,22 @@ pub fn scatter_anndata(
 
     for name in &["var", "uns", "varm", "varp"] {
         if src_items.contains(&name.to_string()) {
+            let t0 = std::time::Instant::now();
             for o in outputs {
                 copy_zarr_dir(&src_path.join(name), &o.path.join(name))?;
             }
+            log::info!("Copied group '{}' in {:.1}s", name, t0.elapsed().as_secs_f64());
         }
     }
 
     if src_items.contains(&"X".to_string()) {
+        let t0 = std::time::Instant::now();
+        log::info!("Starting scatter of 'X'...");
         scatter_matrix_element(
             &src_store, &dst_stores, "X", assignments, &store_n_rows, &pool,
             &resolved_config, passthrough_possible, src_path, outputs,
         )?;
+        log::info!("Scatter 'X' complete in {:.1}s", t0.elapsed().as_secs_f64());
     }
 
     for group_name in &["obsm", "obsp", "layers"] {
@@ -318,6 +323,8 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
     outputs: &[OutputStoreConfig],
     group_rel_path: &str,
 ) -> Result<()> {
+    let csr_t0 = std::time::Instant::now();
+
     let src_g = src_group.open_group(name)?;
     let shape_attr: Vec<u64> = src_g.get_attr("shape")?;
     let n_rows = shape_attr[0] as usize;
@@ -328,6 +335,9 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
     let src_indptr: Vec<i64> = src_indptr_ds
         .read_array_slice_cast::<i64, Ix1, _>(&indptr_sel)?
         .to_vec();
+
+    log::info!("scatter_csr '{}': read src indptr ({} rows) in {:.1}s",
+        name, n_rows, csr_t0.elapsed().as_secs_f64());
 
     let mut store_indptrs: Vec<Vec<i64>> = store_n_rows.iter()
         .map(|&n| vec![0i64; n + 1])
@@ -434,8 +444,8 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
     };
 
     log::info!(
-        "scatter_csr_group '{}': {} total assignments, {} after passthrough filter",
-        name, assignments.len(), effective_assignments.len()
+        "scatter_csr_group '{}': {} total assignments, {} after passthrough filter, setup took {:.1}s",
+        name, assignments.len(), effective_assignments.len(), csr_t0.elapsed().as_secs_f64()
     );
 
     let mut store_arrays: Vec<SparseStoreArrays<'_, _>> = Vec::new();
@@ -448,6 +458,7 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
 
     let mut store_states: Vec<CsrStoreState> = Vec::new();
 
+    let ds_t0 = std::time::Instant::now();
     for (store_id, dst_group) in dst_groups.iter().enumerate() {
         let n_out = store_n_rows[store_id];
         let total_nnz = *store_indptrs[store_id].last().unwrap() as usize;
@@ -483,6 +494,9 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
             (dd, di)
         };
 
+        log::info!("scatter_csr store {}: created dst datasets (total_nnz={}, n_out={}) in {:.1}s",
+            store_id, total_nnz, n_out, ds_t0.elapsed().as_secs_f64());
+
         store_states.push(CsrStoreState {
             _group: dst_g,
             data_ds: dst_data_ds,
@@ -498,6 +512,9 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
         });
     }
 
+    log::info!("scatter_csr '{}': starting scatter_data_indices ({:.1}s since csr_group start)",
+        name, csr_t0.elapsed().as_secs_f64());
+
     let scatterer = SparseScatterer::new(pool.clone_with_same_budget());
     scatterer.scatter_data_indices(
         src_indices_ds.inner(),
@@ -507,6 +524,8 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
         &src_indptr,
         false,
     )?;
+
+    log::info!("scatter_csr '{}': total elapsed {:.1}s", name, csr_t0.elapsed().as_secs_f64());
 
     Ok(())
 }

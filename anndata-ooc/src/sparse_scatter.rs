@@ -52,10 +52,16 @@ impl SparseScatterer {
 
         let headroom = 8 * 1024 * 1024;
         let available = self.pool.budget().available().saturating_sub(headroom);
-        let max_nnz_per_pass = if bytes_per_nnz > 0 {
-            (available / bytes_per_nnz / 2).max(4096)
+
+        let src_chunk_nnz = get_chunk_size_1d(src_data);
+        let n_threads = rayon::current_num_threads();
+        let src_concurrent_bytes = n_threads * src_chunk_nnz * bytes_per_nnz * 2;
+        let dst_budget = available.saturating_sub(src_concurrent_bytes);
+
+        let max_nnz_per_pass = if bytes_per_nnz > 0 && dst_budget > 0 {
+            (dst_budget / bytes_per_nnz).max(4096)
         } else {
-            usize::MAX
+            (available / bytes_per_nnz / 2).max(4096)
         };
 
         let store_indptrs: Vec<&[i64]> = stores.iter()
@@ -74,8 +80,12 @@ impl SparseScatterer {
         );
 
         log::info!(
-            "SparseScatterer: {} assignments, {} passes (streaming), max_nnz/pass={}",
-            assignments.len(), passes.len(), max_nnz_per_pass
+            "SparseScatterer: {} assignments, {} passes (streaming), max_nnz/pass={}, \
+             dst_budget={:.1}GB, src_concurrent={:.1}GB ({} threads, chunk={})",
+            assignments.len(), passes.len(), max_nnz_per_pass,
+            dst_budget as f64 / 1e9,
+            src_concurrent_bytes as f64 / 1e9,
+            n_threads, src_chunk_nnz,
         );
 
         for (pass_idx, pass) in passes.iter().enumerate() {
@@ -109,21 +119,44 @@ impl SparseScatterer {
     where
         S: ReadableWritableListableStorageTraits + ?Sized + 'static,
     {
+        let pass_t0 = std::time::Instant::now();
+
+        let total_buf_bytes: usize = pass.chunks.iter()
+            .map(|sc| (sc.nnz_end - sc.nnz_start) * (data_elem_size + indices_elem_size))
+            .sum();
+        log::info!(
+            "process_pass: allocating {} dst chunk buffers ({:.1} GB), {} entries total",
+            pass.chunks.len(),
+            total_buf_bytes as f64 / 1e9,
+            pass.chunks.iter().map(|sc| sc.entries.len()).sum::<usize>(),
+        );
+
         let dst_bufs: Vec<DstChunkBuf> = pass.chunks.iter().map(|sc| {
             let chunk_nnz = sc.nnz_end - sc.nnz_start;
+            let data_len = chunk_nnz * data_elem_size;
+            let indices_len = chunk_nnz * indices_elem_size;
+            let mut data_buf = Vec::with_capacity(data_len);
+            let mut indices_buf = Vec::with_capacity(indices_len);
+            // SAFETY: every byte position [0..chunk_nnz) will be written exactly
+            // once before flush reads the buffer. The atomic remaining counter
+            // enforces this. Skipping zero-fill avoids touching ~30GB of pages.
+            unsafe {
+                data_buf.set_len(data_len);
+                indices_buf.set_len(indices_len);
+            }
             DstChunkBuf {
                 store_id: sc.store_id,
                 nnz_start: sc.nnz_start,
                 nnz_end: sc.nnz_end,
-                data_buf: vec![0u8; chunk_nnz * data_elem_size],
-                indices_buf: vec![0u8; chunk_nnz * indices_elem_size],
+                data_buf,
+                indices_buf,
                 remaining: AtomicUsize::new(sc.entries.len()),
                 flushed: AtomicUsize::new(0),
             }
         }).collect();
 
-        // Build a lookup: source_row -> list of (dst_chunk_idx, entry)
-        // so that when we decode a source row, we know which dst buffers to fill.
+        log::info!("process_pass: buffers allocated in {:.1}s", pass_t0.elapsed().as_secs_f64());
+
         let mut src_to_dst: std::collections::HashMap<usize, Vec<(usize, SparseScatterEntry)>> =
             std::collections::HashMap::new();
         for (chunk_idx, sc) in pass.chunks.iter().enumerate() {
@@ -135,7 +168,6 @@ impl SparseScatterer {
             }
         }
 
-        // Collect unique source rows, build merged read runs
         let mut source_rows: Vec<usize> = src_to_dst.keys().copied().collect();
         source_rows.sort_unstable();
 
@@ -152,8 +184,23 @@ impl SparseScatterer {
         let src_chunk_size = get_chunk_size_1d(src_data);
         let sub_runs = split_merged_runs_by_chunk(&merged, src_indptr, src_chunk_size);
 
-        // Collect flush errors
+        let total_read_nnz: usize = sub_runs.iter()
+            .map(|s| s.nnz_end - s.nnz_start)
+            .sum();
+        log::info!(
+            "process_pass: {} merged runs -> {} sub_runs, total_read_nnz={} ({:.1} GB), \
+             src_chunk_size={}, planning took {:.1}s",
+            merged.len(), sub_runs.len(),
+            total_read_nnz,
+            total_read_nnz as f64 * (data_elem_size + indices_elem_size) as f64 / 1e9,
+            src_chunk_size,
+            pass_t0.elapsed().as_secs_f64(),
+        );
+
         let flush_errors: Mutex<Vec<anyhow::Error>> = Mutex::new(Vec::new());
+        let reads_done = AtomicUsize::new(0);
+        let writes_done = AtomicUsize::new(0);
+        let total_subs = sub_runs.len();
 
         // -- Stream: decode sub-runs in parallel, scatter + flush --
         sub_runs.par_iter().try_for_each(|sub| -> Result<()> {
@@ -171,6 +218,14 @@ impl SparseScatterer {
             let indices_bytes: ArrayBytes<'static> =
                 src_indices.retrieve_array_subset(&subset)?;
             let indices_raw = indices_bytes.into_fixed()?.into_owned();
+
+            let rd = reads_done.fetch_add(1, Ordering::Relaxed) + 1;
+            if rd % 500 == 0 || rd == total_subs {
+                log::info!(
+                    "  sub_run read {}/{} ({:.1}s elapsed)",
+                    rd, total_subs, pass_t0.elapsed().as_secs_f64(),
+                );
+            }
 
             for a in &sub.assignments {
                 let lo = src_indptr[a.source_row] as usize;
@@ -253,6 +308,13 @@ impl SparseScatterer {
                             ) {
                                 flush_errors.lock().unwrap().push(e);
                             }
+                            let wd = writes_done.fetch_add(1, Ordering::Relaxed) + 1;
+                            if wd % 500 == 0 || wd == pass.chunks.len() {
+                                log::info!(
+                                    "  dst chunk flushed {}/{} ({:.1}s elapsed)",
+                                    wd, pass.chunks.len(), pass_t0.elapsed().as_secs_f64(),
+                                );
+                            }
                         }
                     }
                 }
@@ -260,14 +322,11 @@ impl SparseScatterer {
             Ok(())
         })?;
 
-        // Check for flush errors
         let errors = flush_errors.into_inner().unwrap();
         if let Some(e) = errors.into_iter().next() {
             return Err(e);
         }
 
-        // Flush any dst chunks that were never triggered (shouldn't happen
-        // if the planner is correct, but safety net)
         for buf in &dst_bufs {
             if buf.flushed.load(Ordering::Acquire) == 0
                 && buf.remaining.load(Ordering::Acquire) == 0
@@ -276,6 +335,8 @@ impl SparseScatterer {
                 flush_chunk(buf, stores, data_elem_size, indices_elem_size)?;
             }
         }
+
+        log::info!("process_pass complete: {:.1}s total", pass_t0.elapsed().as_secs_f64());
 
         Ok(())
     }
