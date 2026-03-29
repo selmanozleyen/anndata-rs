@@ -9,7 +9,6 @@
 ///       --memory-gb 4 8 16 20 32 64 --op shuffle -v
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Read;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -72,7 +71,13 @@ fn main() {
                 4, 8, &label, args.verbose,
             );
             eprintln!("  shuffle sim: {:.1}s", t0.elapsed().as_secs_f64());
-            summary.push(SummaryRow { op: "shuffle", mem_gb, ..result });
+            summary.push(SummaryRow {
+                op: "shuffle", mem_gb,
+                n_rows: result.n_rows, batches: result.batches,
+                merged_runs: result.merged_runs, sub_runs: result.sub_runs,
+                dst_chunks: result.dst_chunks, read_gib: result.read_gib,
+                write_gib: result.write_gib, read_amp: result.read_amp,
+            });
         }
 
         if args.op == "truncate" || args.op == "all" {
@@ -95,7 +100,13 @@ fn main() {
                 args.src_chunk_size, args.dst_chunk_size,
                 4, 8, &label, args.verbose,
             );
-            summary.push(SummaryRow { op: "truncate", mem_gb, ..result });
+            summary.push(SummaryRow {
+                op: "truncate", mem_gb,
+                n_rows: result.n_rows, batches: result.batches,
+                merged_runs: result.merged_runs, sub_runs: result.sub_runs,
+                dst_chunks: result.dst_chunks, read_gib: result.read_gib,
+                write_gib: result.write_gib, read_amp: result.read_amp,
+            });
         }
 
         if args.op == "split" || args.op == "all" {
@@ -772,7 +783,10 @@ fn blosc_decompress(input: &[u8]) -> Vec<u8> {
     // let's use a raw FFI call to the blosc library that's already linked.
 
     // Actually, let's use zarrs' codec infrastructure since it's already a dependency.
-    use zarrs::array::codec::BytesToBytesCodecTraits;
+    use std::borrow::Cow;
+    use zarrs::array::BytesToBytesCodecTraits;
+    use zarrs::array::CodecOptions;
+    use zarrs::array::BytesRepresentation;
 
     let blosc_config = serde_json::json!({
         "cname": "lz4",
@@ -787,12 +801,13 @@ fn blosc_decompress(input: &[u8]) -> Vec<u8> {
 
     let decoded = codec
         .decode(
-            bytes::Bytes::from(input.to_vec()),
-            &zarrs::array::codec::CodecOptions::default(),
+            Cow::Borrowed(input),
+            &BytesRepresentation::FixedSize(input.len() as u64),
+            &CodecOptions::default(),
         )
         .expect("blosc decompress failed");
 
-    decoded.to_vec()
+    decoded.into_owned()
 }
 
 // -- Utilities --

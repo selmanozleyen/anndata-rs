@@ -1,6 +1,8 @@
 use crate::backend::{AttributeOp, Backend, BackendData, DataContainer, GroupOp, ScalarType};
 use crate::data::{ArrayData, array::DynArray, array::utils::ExtendableDataset};
-use crate::{ArrayElem, Selectable};
+#[cfg(feature = "polars")]
+use crate::ArrayElem;
+use crate::Selectable;
 
 use super::{CsrNonCanonical, DynCscMatrix, DynCsrMatrix, DynCsrNonCanonical};
 use anyhow::{Context, Result, bail};
@@ -32,6 +34,7 @@ impl<B: Backend> MatrixBuilder<B> {
         }
     }
 
+    #[cfg(feature = "polars")]
     pub fn finish(self) -> Result<ArrayElem<B>> {
         let container = match self {
             Self::CsrMatrix(builder) => builder.finish(),
