@@ -12,9 +12,9 @@ homepage = "https://github.com/kaizhang/anndata-rs"
 keywords = ["data"]
 
 [dependencies]
-anndata = { workspace = true, features = ["polars"] }
-anndata-hdf5 = { workspace = true }
-anndata-zarr = { workspace = true }
+anndata = { workspace = true }
+anndata-hdf5 = { workspace = true, default-features = false }
+anndata-zarr = { workspace = true, default-features = false }
 anndata-ooc = { workspace = true }
 anyhow = "1.0"
 downcast-rs = "2"
@@ -22,8 +22,8 @@ numpy = "0.27"
 ndarray = "0.17"
 nalgebra-sparse = "0.11"
 hdf5 = { package = "hdf5-metno", version = "0.12" }
-polars = { version = "0.53", features = ["ndarray"] }
-pyo3-polars = {version = "0.26", features = ["dtype-full", "dtype-struct"] }
+polars = { version = "0.53", features = ["ndarray"], optional = true }
+pyo3-polars = { version = "0.26", features = ["dtype-full", "dtype-struct"], optional = true }
 rand = "0.9"
 flate2 = "1.0"
 rayon = "1.11"
@@ -33,6 +33,8 @@ version = "0.27"
 features = ["multiple-pymethods", "anyhow"]
 
 [features]
+default = ["polars"]
+polars = ["dep:polars", "dep:pyo3-polars", "anndata/polars", "anndata-hdf5/polars", "anndata-zarr/polars"]
 extension-module = ["pyo3/extension-module"]
 
 [lib]

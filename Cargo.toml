@@ -12,7 +12,7 @@ resolver = "2"
 
 [workspace.dependencies]
 anndata = { path = "anndata", default-features = false }
-anndata-hdf5 = { path = "anndata-hdf5" }
-anndata-zarr = { path = "anndata-zarr" }
+anndata-hdf5 = { path = "anndata-hdf5", default-features = false }
+anndata-zarr = { path = "anndata-zarr", default-features = false }
 anndata-ooc = { path = "anndata-ooc" }
 pyanndata = { path = "pyanndata" }
