@@ -92,8 +92,8 @@ pub fn scatter_anndata(
 
     for name in &["var", "uns", "varm", "varp"] {
         if src_items.contains(&name.to_string()) {
-            for dst_store in &dst_stores {
-                copy_group(&src_store, dst_store, name)?;
+            for o in outputs {
+                copy_zarr_dir(&src_path.join(name), &o.path.join(name))?;
             }
         }
     }
@@ -247,8 +247,9 @@ fn scatter_matrix_element_in_group<G: GroupOp<Zarr>>(
         }
         other => {
             log::warn!("Unsupported encoding {:?} for '{}', copying to all stores", other, name);
-            for dst_group in dst_groups {
-                copy_group_child(src_group, dst_group, name)?;
+            let src_dir = src_path.join(group_rel_path);
+            for o in outputs {
+                copy_zarr_dir(&src_dir, &o.path.join(group_rel_path))?;
             }
         }
     }
@@ -706,31 +707,31 @@ fn clone_dataset_with_shape<G: GroupOp<Zarr>>(
     Ok(src_ds_tmp)
 }
 
-fn copy_group<G: GroupOp<Zarr>>(
-    src_store: &G,
-    dst_store: &G,
-    name: &str,
-) -> Result<()> {
-    use anndata::data::{Data, data_traits::{Readable, Writable}};
-    use anndata::backend::DataContainer;
-
-    let container = DataContainer::<Zarr>::open(src_store, name)?;
-    let data = Data::read(&container)?;
-    data.write(dst_store, name)?;
-    Ok(())
+fn copy_zarr_dir(src: &Path, dst: &Path) -> Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    if dst.exists() {
+        std::fs::remove_dir_all(dst)
+            .with_context(|| format!("failed to remove existing {}", dst.display()))?;
+    }
+    copy_dir_recursive(src, dst)
+        .with_context(|| format!("failed to copy {} -> {}", src.display(), dst.display()))
 }
 
-fn copy_group_child<G1: GroupOp<Zarr>, G2: GroupOp<Zarr>>(
-    src_group: &G1,
-    dst_group: &G2,
-    name: &str,
-) -> Result<()> {
-    use anndata::data::{Data, data_traits::{Readable, Writable}};
-    use anndata::backend::DataContainer;
-
-    let container = DataContainer::<Zarr>::open(src_group, name)?;
-    let data = Data::read(&container)?;
-    data.write(dst_group, name)?;
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let s = entry.path();
+        let d = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_recursive(&s, &d)?;
+        } else {
+            std::fs::copy(&s, &d)?;
+        }
+    }
     Ok(())
 }
 
