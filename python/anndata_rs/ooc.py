@@ -69,7 +69,6 @@ def scatter(
     src_obs = ad.read_zarr(input).obs
     for dst_path, idx in rust_outputs:
         dst_obs = src_obs.iloc[idx].copy()
-        dst_obs.reset_index(drop=True, inplace=True)
         store = zarr.open(dst_path, mode="r+")
         ad.io.write_elem(store, "obs", dst_obs)
 
