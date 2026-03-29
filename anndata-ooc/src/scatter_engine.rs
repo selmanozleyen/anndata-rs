@@ -1,5 +1,4 @@
-use std::path::{Path, PathBuf};
-use std::collections::HashMap;
+use std::path::Path;
 
 use anyhow::{Result, Context};
 use ndarray::{Array1, ArrayD, Ix1};
@@ -11,7 +10,7 @@ use anndata_zarr::Zarr;
 use crate::budget::{BufferPool, MemoryBudget};
 use crate::dense_scatter::DenseScatterer;
 use crate::sparse_scatter::{SparseScatterer, SparseStoreArrays};
-use crate::scatter::{RowAssignment, ScatterPlanner};
+use crate::scatter::RowAssignment;
 
 /// Configuration for the scatter engine (shared across all output stores).
 pub struct ScatterConfig {
@@ -34,15 +33,16 @@ impl Default for ScatterConfig {
 
 /// Per-output-store configuration and metadata.
 pub struct OutputStoreConfig {
-    pub path: PathBuf,
+    pub path: std::path::PathBuf,
     pub n_rows: usize,
 }
 
-/// Scatter an AnnData Zarr store into one or more output stores.
+/// Scatter the matrix data of an AnnData Zarr store into one or more outputs.
 ///
-/// This is the unified I/O engine. `assignments` maps each source row to a
-/// (store_id, output_row) pair. Multiple output stores share a single source
-/// read pass for maximum I/O efficiency.
+/// Handles X, obsm, obsp, layers (the large row-indexed arrays) and copies
+/// var, uns, varm, varp unchanged. obs is NOT handled here -- the caller
+/// (Python) writes obs DataFrames directly, since pandas handles categoricals,
+/// nullable dtypes, etc. natively.
 pub fn scatter_anndata(
     src_path: &Path,
     outputs: &[OutputStoreConfig],
@@ -72,11 +72,6 @@ pub fn scatter_anndata(
                 copy_group(&src_store, dst_store, name)?;
             }
         }
-    }
-
-    // Scatter obs (row annotations)
-    if src_items.contains(&"obs".to_string()) {
-        scatter_dataframe_group(&src_store, &dst_stores, "obs", assignments, &store_n_rows)?;
     }
 
     // Scatter X
@@ -115,75 +110,6 @@ pub fn scatter_anndata(
     Ok(())
 }
 
-/// Split an AnnData Zarr store by the values of an obs column.
-///
-/// Each unique value in the column becomes a separate output store.
-/// Returns the list of (value, output_path) pairs.
-pub fn split_anndata(
-    src_path: &Path,
-    output_dir: &Path,
-    column: &str,
-    config: &ScatterConfig,
-) -> Result<Vec<(String, PathBuf)>> {
-    let src_store: <Zarr as Backend>::Store = Zarr::open(src_path)
-        .with_context(|| format!("failed to open source: {}", src_path.display()))?;
-
-    // Read the obs column to determine group membership
-    let obs_group = src_store.open_group("obs")?;
-    let col_ds = obs_group.open_dataset(column)
-        .with_context(|| format!("obs column '{}' not found", column))?;
-    let n_rows = col_ds.shape()[0];
-
-    let sel = [SelectInfoElem::from(0..n_rows)];
-    let col_data = col_ds.read_dyn_array_slice(&sel)?;
-
-    // Convert values to strings for grouping
-    let string_values = dyn_array_to_strings(&col_data)?;
-
-    {
-        use anndata::backend::StoreOp;
-        src_store.close()?;
-    }
-
-    // Build group mapping: value -> store_id
-    let mut value_to_id: HashMap<String, u16> = HashMap::new();
-    let mut group_names: Vec<String> = Vec::new();
-    let mut group_ids: Vec<u16> = Vec::with_capacity(n_rows);
-
-    for val in &string_values {
-        let id = if let Some(&id) = value_to_id.get(val) {
-            id
-        } else {
-            let id = group_names.len() as u16;
-            value_to_id.insert(val.clone(), id);
-            group_names.push(val.clone());
-            id
-        };
-        group_ids.push(id);
-    }
-
-    let n_stores = group_names.len();
-    let (assignments, store_n_rows) = ScatterPlanner::from_groups(&group_ids, n_stores);
-
-    // Build output store configs
-    let outputs: Vec<OutputStoreConfig> = group_names.iter().enumerate().map(|(i, name)| {
-        let safe_name = name.replace(['/', '\\', ' '], "_");
-        OutputStoreConfig {
-            path: output_dir.join(format!("{}.zarr", safe_name)),
-            n_rows: store_n_rows[i],
-        }
-    }).collect();
-
-    let result: Vec<(String, PathBuf)> = group_names.iter()
-        .zip(outputs.iter())
-        .map(|(name, o)| (name.clone(), o.path.clone()))
-        .collect();
-
-    scatter_anndata(src_path, &outputs, &assignments, config)?;
-
-    Ok(result)
-}
-
 // --- Internal functions ---
 
 fn scatter_matrix_element<G: GroupOp<Zarr>>(
@@ -216,13 +142,13 @@ fn scatter_matrix_element_in_group<G: GroupOp<Zarr>>(
         DataType::Array(scalar_type) | DataType::Scalar(scalar_type) => {
             let src_ds = src_group.open_dataset(name)?;
             let shape = src_ds.shape();
-            if shape.ndim() < 2 {
-                scatter_1d_dataset(src_group, dst_groups, name, assignments, store_n_rows)?;
-            } else {
+            if shape.ndim() >= 2 {
                 scatter_dense_dataset(
                     src_group, dst_groups, name, assignments, store_n_rows,
                     scalar_type, pool, config,
                 )?;
+            } else {
+                log::warn!("Skipping 1-D dataset '{}' (obs handled in Python)", name);
             }
         }
         DataType::CsrMatrix(scalar_type) => {
@@ -259,7 +185,6 @@ fn scatter_dense_dataset<G: GroupOp<Zarr>>(
     let src_ds = src_group.open_dataset(name)?;
     let src_shape = src_ds.shape();
 
-    // Create destination datasets
     let mut dst_datasets: Vec<<Zarr as Backend>::Dataset> = Vec::with_capacity(dst_groups.len());
     for (i, dst_group) in dst_groups.iter().enumerate() {
         let mut out_shape = src_shape.as_ref().to_vec();
@@ -273,53 +198,11 @@ fn scatter_dense_dataset<G: GroupOp<Zarr>>(
         dst_datasets.push(ds);
     }
 
-    // Get raw zarrs Array references
     let dst_inners: Vec<_> = dst_datasets.iter().map(|d| d.inner()).collect();
     let dst_refs: Vec<&zarrs::array::Array<_>> = dst_inners.iter().map(|a| *a).collect();
 
     let scatterer = DenseScatterer::new(pool.clone_with_same_budget());
     scatterer.scatter(src_ds.inner(), &dst_refs, assignments, store_n_rows)
-}
-
-fn scatter_1d_dataset<G: GroupOp<Zarr>>(
-    src_group: &G,
-    dst_groups: &[impl GroupOp<Zarr>],
-    name: &str,
-    assignments: &[RowAssignment],
-    store_n_rows: &[usize],
-) -> Result<()> {
-    let src_ds = src_group.open_dataset(name)?;
-    let dtype = src_ds.dtype()?;
-    let n = src_ds.shape()[0];
-
-    let sel = [SelectInfoElem::from(0..n)];
-    let full = src_ds.read_dyn_array_slice(&sel)?;
-
-    // Build per-store permutation arrays from assignments
-    for (store_id, dst_group) in dst_groups.iter().enumerate() {
-        let n_out = store_n_rows[store_id];
-        let mut out_shape = src_ds.shape().as_ref().to_vec();
-        out_shape[0] = n_out;
-
-        let mut dst_ds = dst_group.new_empty_dataset_typed(
-            name, dtype, &out_shape.into(),
-        )?;
-        copy_encoding_attrs(&src_ds, &mut dst_ds)?;
-
-        // Collect the source rows for this store in output order
-        let mut store_perm: Vec<(usize, usize)> = assignments.iter()
-            .filter(|a| a.store_id == store_id as u16)
-            .map(|a| (a.output_row, a.source_row))
-            .collect();
-        store_perm.sort_unstable_by_key(|&(out, _)| out);
-
-        let perm: Vec<usize> = store_perm.iter().map(|&(_, src)| src).collect();
-        let permuted = permute_dyn_array_1d(&full, &perm);
-        let write_sel = vec![SelectInfoElem::from(0..n_out)];
-        write_dyn_slice(&dst_ds, &permuted, &write_sel, dtype)?;
-    }
-
-    Ok(())
 }
 
 fn scatter_csr_group<G: GroupOp<Zarr>>(
@@ -337,40 +220,34 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
     let n_rows = shape_attr[0] as usize;
     let n_cols = shape_attr[1] as usize;
 
-    // Read source indptr
     let src_indptr_ds = src_g.open_dataset("indptr")?;
     let indptr_sel = [SelectInfoElem::from(0..n_rows + 1)];
     let src_indptr: Vec<i64> = src_indptr_ds
         .read_array_slice_cast::<i64, Ix1, _>(&indptr_sel)?
         .to_vec();
 
-    // Build per-store output indptr
     let mut store_indptrs: Vec<Vec<i64>> = store_n_rows.iter()
         .map(|&n| vec![0i64; n + 1])
         .collect();
 
-    // For each assignment, accumulate NNZ into the right store's indptr
     for a in assignments {
         let row_nnz = src_indptr[a.source_row + 1] - src_indptr[a.source_row];
         let indptr = &mut store_indptrs[a.store_id as usize];
         indptr[a.output_row + 1] = row_nnz;
     }
 
-    // Prefix sum to get actual indptr values
     for indptr in &mut store_indptrs {
         for i in 1..indptr.len() {
             indptr[i] += indptr[i - 1];
         }
     }
 
-    // Create output groups and datasets
     let src_data_ds = src_g.open_dataset("data")?;
     let src_indices_ds = src_g.open_dataset("indices")?;
     let indices_dtype = src_indices_ds.dtype()?;
 
     let mut store_arrays: Vec<SparseStoreArrays<'_, _>> = Vec::new();
 
-    // We need to keep the groups alive, so collect them
     struct CsrStoreState {
         _group: <Zarr as Backend>::Group,
         data_ds: <Zarr as Backend>::Dataset,
@@ -410,7 +287,6 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
         });
     }
 
-    // Build SparseStoreArrays references
     for (store_id, state) in store_states.iter().enumerate() {
         store_arrays.push(SparseStoreArrays {
             dst_indices: state.indices_ds.inner(),
@@ -427,43 +303,6 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
         assignments,
         &src_indptr,
     )?;
-
-    Ok(())
-}
-
-fn scatter_dataframe_group(
-    src_store: &<Zarr as Backend>::Store,
-    dst_stores: &[<Zarr as Backend>::Store],
-    name: &str,
-    assignments: &[RowAssignment],
-    store_n_rows: &[usize],
-) -> Result<()> {
-    let src_g = src_store.open_group(name)?;
-
-    let mut dst_groups: Vec<<Zarr as Backend>::Group> = Vec::new();
-    for dst_store in dst_stores {
-        let mut dst_g = dst_store.new_group(name)?;
-
-        if let Ok(enc) = src_g.get_json_attr("encoding-type") {
-            dst_g.new_json_attr("encoding-type", &enc)?;
-        }
-        if let Ok(enc) = src_g.get_json_attr("encoding-version") {
-            dst_g.new_json_attr("encoding-version", &enc)?;
-        }
-        if let Ok(idx) = src_g.get_json_attr("_index") {
-            dst_g.new_json_attr("_index", &idx)?;
-        }
-        if let Ok(ord) = src_g.get_json_attr("column-order") {
-            dst_g.new_json_attr("column-order", &ord)?;
-        }
-
-        dst_groups.push(dst_g);
-    }
-
-    let children = src_g.list()?;
-    for col_name in &children {
-        scatter_1d_dataset(&src_g, &dst_groups, col_name, assignments, store_n_rows)?;
-    }
 
     Ok(())
 }
@@ -542,82 +381,7 @@ fn copy_group_child<G1: GroupOp<Zarr>, G2: GroupOp<Zarr>>(
     Ok(())
 }
 
-use anndata::data::array::DynArray;
-
-fn permute_dyn_array_1d(arr: &DynArray, permutation: &[usize]) -> DynArray {
-    macro_rules! permute_1d {
-        ($arr:expr, $perm:expr, $( $variant:ident ),+ $(,)?) => {
-            match $arr {
-                $(
-                    DynArray::$variant(a) => {
-                        let src = a.as_slice().expect("1D array must be contiguous");
-                        let permuted: Vec<_> = $perm.iter().map(|&i| src[i].clone()).collect();
-                        DynArray::$variant(Array1::from_vec(permuted).into_dyn())
-                    }
-                )+
-            }
-        }
-    }
-    permute_1d!(arr, permutation, U8, U16, U32, U64, I8, I16, I32, I64, F32, F64, Bool, String)
-}
-
-fn write_dyn_slice(
-    ds: &<Zarr as Backend>::Dataset,
-    arr: &DynArray,
-    sel: &[SelectInfoElem],
-    _dtype: ScalarType,
-) -> Result<()> {
-    macro_rules! write_typed {
-        ($ds:expr, $arr:expr, $sel:expr, $( $variant:ident => $ty:ty ),+ $(,)?) => {
-            match $arr {
-                $(
-                    DynArray::$variant(a) => $ds.write_array_slice(a.view().into(), $sel),
-                )+
-            }
-        }
-    }
-
-    write_typed!(ds, arr, sel,
-        U8 => u8,
-        U16 => u16,
-        U32 => u32,
-        U64 => u64,
-        I8 => i8,
-        I16 => i16,
-        I32 => i32,
-        I64 => i64,
-        F32 => f32,
-        F64 => f64,
-        Bool => bool,
-        String => String,
-    )
-}
-
-fn dyn_array_to_strings(arr: &DynArray) -> Result<Vec<String>> {
-    macro_rules! to_strings {
-        ($arr:expr, $( $variant:ident ),+ $(,)?) => {
-            match $arr {
-                $(
-                    DynArray::$variant(a) => {
-                        let s = a.as_slice().expect("1D array must be contiguous");
-                        Ok(s.iter().map(|v| format!("{}", v)).collect())
-                    }
-                )+
-                DynArray::String(a) => {
-                    let s = a.as_slice().expect("1D array must be contiguous");
-                    Ok(s.to_vec())
-                }
-                DynArray::Bool(a) => {
-                    let s = a.as_slice().expect("1D array must be contiguous");
-                    Ok(s.iter().map(|v| format!("{}", v)).collect())
-                }
-            }
-        }
-    }
-    to_strings!(arr, U8, U16, U32, U64, I8, I16, I32, I64, F32, F64)
-}
-
-/// Extension trait for creating typed empty datasets (mirrors the one in permute.rs).
+/// Extension trait for creating typed empty datasets with optional chunk/shard config.
 trait GroupOpExt<B: Backend>: GroupOp<B> {
     fn new_empty_dataset_typed(
         &self,

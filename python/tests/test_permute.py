@@ -1,12 +1,11 @@
-"""Tests for anndata_rs.permute -- out-of-core Zarr AnnData permutation.
+"""Tests for anndata_rs out-of-core scatter engine.
 
-Every test writes a source .zarr AnnData via anndata_rs, permutes it, then
-reads the result back with both anndata_rs.read() and anndata.read_zarr()
-and compares against the expected permuted data.
+Tests permutation, splitting, categorical obs columns, duplicate indices,
+and subset operations via anndata_rs.permute / split / scatter.
 """
 
-import tempfile
-import shutil
+import json
+import os
 from pathlib import Path
 
 import anndata as ad
@@ -202,6 +201,58 @@ class TestObsPermute:
             assert actual == expected, f"Column {col} mismatch"
 
 
+class TestCategoricalObs:
+    """Verify categorical obs columns survive permute and split."""
+
+    def test_permute_categorical(self, zarr_pair):
+        src, dst = zarr_pair
+        np.random.seed(100)
+        n = 60
+        X = np.random.randn(n, 10).astype(np.float32)
+        obs = pd.DataFrame({
+            "cell_type": pd.Categorical(
+                np.random.choice(["T", "B", "NK", "Mono"], n)
+            ),
+            "score": np.random.randn(n).astype(np.float32),
+        }, index=[f"cell_{i}" for i in range(n)])
+        _make_adata(src, X, obs=obs)
+
+        perm = np.random.permutation(n).astype(np.int64)
+        anndata_rs.permute(src, dst, perm)
+
+        result = ad.read_zarr(dst)
+        src_ad = ad.read_zarr(src)
+
+        np.testing.assert_allclose(result.X, X[perm], atol=1e-6)
+        expected_types = src_ad.obs["cell_type"].values[perm]
+        actual_types = result.obs["cell_type"].values
+        assert list(actual_types) == list(expected_types)
+
+    def test_split_categorical(self, tmp_path):
+        src = str(tmp_path / "src.zarr")
+        np.random.seed(101)
+        n = 90
+        X = np.random.randn(n, 15).astype(np.float32)
+        types = pd.Categorical(["T", "B", "NK"] * 30)
+        obs = pd.DataFrame({
+            "cell_type": types,
+            "val": np.random.randn(n).astype(np.float32),
+        }, index=[f"c_{i}" for i in range(n)])
+        _make_adata(src, X, obs=obs)
+
+        out_dir = str(tmp_path / "split_cat")
+        groups = anndata_rs.split(src, out_dir, "cell_type", obs=obs)
+
+        total = 0
+        for val, path in groups:
+            result = ad.read_zarr(path)
+            mask = obs["cell_type"] == val
+            expected_X = X[mask.values]
+            np.testing.assert_allclose(result.X, expected_X, atol=1e-6)
+            total += result.X.shape[0]
+        assert total == n
+
+
 class TestVarUnchanged:
     def test_var_preserved(self, zarr_pair):
         src, dst = zarr_pair
@@ -234,7 +285,6 @@ class TestChunkSize:
         perm = np.random.permutation(500).astype(np.int64)
         anndata_rs.permute(src, dst, perm, chunk_size=256)
 
-        import json, os
         with open(os.path.join(dst, "X", "zarr.json")) as f:
             d = json.load(f)
             for codec in d.get("codecs", []):
@@ -262,7 +312,6 @@ class TestChunkSize:
 class TestShardSize:
     @staticmethod
     def _get_zarr_shapes(dst):
-        import json, os
         with open(os.path.join(dst, "X", "zarr.json")) as f:
             d = json.load(f)
         shard = d["chunk_grid"]["configuration"]["chunk_shape"]
@@ -297,7 +346,7 @@ class TestShardSize:
 
         perm = np.random.permutation(n_obs).astype(np.int64)
         anndata_rs.permute(src, dst, perm, chunk_size=128,
-                           target_shard_bytes=1 * 1024 * 1024)
+                 target_shard_bytes=1 * 1024 * 1024)
 
         shard, sub_chunk = self._get_zarr_shapes(dst)
         shard_bytes = shard[0] * shard[1] * 4
@@ -316,7 +365,7 @@ class TestShardSize:
 
         perm = np.random.permutation(n_obs).astype(np.int64)
         anndata_rs.permute(src, dst, perm, chunk_size=128,
-                           target_shard_bytes=4 * 1024 * 1024)
+                 target_shard_bytes=4 * 1024 * 1024)
 
         shard, sub_chunk = self._get_zarr_shapes(dst)
         shard_bytes = shard[0] * shard[1] * 4
@@ -336,11 +385,9 @@ class TestShardSize:
 
         perm = np.random.permutation(n_obs).astype(np.int64)
         anndata_rs.permute(src, dst, perm, chunk_size=128,
-                           shard_size=256, target_shard_bytes=4 * 1024 * 1024)
+                 shard_size=256, target_shard_bytes=4 * 1024 * 1024)
 
         shard, _ = self._get_zarr_shapes(dst)
-        # shard_size=256 would give 256*128*4 = 131072 bytes.
-        # target_shard_bytes=4MB should override and give much larger shards.
         shard_bytes = shard[0] * shard[1] * 4
         assert shard_bytes > 256 * 128 * 4, \
             f"target_shard_bytes should override shard_size, got {shard_bytes}"
@@ -350,7 +397,7 @@ class TestShardSize:
 
 
 class TestAnnDataRsRoundtrip:
-    """Verify anndata_rs.read() can open the permuted output (the bug we fixed)."""
+    """Verify anndata_rs.read() can open the permuted output."""
 
     def test_read_dense(self, zarr_pair):
         src, dst = zarr_pair
@@ -422,7 +469,6 @@ class TestDuplicateIndices:
         X = np.random.randn(50, 20).astype(np.float32)
         _make_adata(src, X)
 
-        # Output has 80 rows, many duplicates
         perm = np.array([0, 0, 0, 1, 1, 2, 3, 3] + list(range(50)) + [49]*22,
                         dtype=np.int64)
         anndata_rs.permute(src, dst, perm)
@@ -482,7 +528,7 @@ class TestSubsetPermute:
 
 
 class TestSplit:
-    """Tests for anndata_rs.split -- split by obs column."""
+    """Tests for scatter-based split by obs column."""
 
     @pytest.fixture
     def split_src(self, tmp_path):
@@ -503,10 +549,9 @@ class TestSplit:
         src, base, X, obs = split_src
         out_dir = str(tmp_path / "split_out")
 
-        groups = anndata_rs.split(src, out_dir, "cell_type")
+        groups = anndata_rs.split(src, out_dir, "cell_type", obs=obs)
 
         assert len(groups) > 0
-        # Verify each group
         total_rows = 0
         for value, path in groups:
             result = ad.read_zarr(path)
@@ -515,7 +560,6 @@ class TestSplit:
                 f"Group '{value}': expected {n_expected} rows, got {result.X.shape[0]}"
             assert result.X.shape[1] == 30
 
-            # Verify X values match
             mask = obs["cell_type"] == value
             expected_X = X[mask.values]
             np.testing.assert_allclose(result.X, expected_X, atol=1e-6)
@@ -527,7 +571,7 @@ class TestSplit:
         src, base, X, obs = split_src
         out_dir = str(tmp_path / "split_var")
 
-        groups = anndata_rs.split(src, out_dir, "cell_type")
+        groups = anndata_rs.split(src, out_dir, "cell_type", obs=obs)
 
         src_ad = ad.read_zarr(src)
         for _, path in groups:
@@ -538,7 +582,7 @@ class TestSplit:
         src, base, X, obs = split_src
         out_dir = str(tmp_path / "split_obs")
 
-        groups = anndata_rs.split(src, out_dir, "cell_type")
+        groups = anndata_rs.split(src, out_dir, "cell_type", obs=obs)
 
         for value, path in groups:
             result = ad.read_zarr(path)

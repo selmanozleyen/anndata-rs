@@ -16,8 +16,7 @@ fn anndata_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(concat, m)?)?;
     m.add_function(wrap_pyfunction!(py_get_default_write_config, m)?)?;
     m.add_function(wrap_pyfunction!(py_set_default_write_config, m)?)?;
-    m.add_function(wrap_pyfunction!(permute, m)?)?;
-    m.add_function(wrap_pyfunction!(split, m)?)?;
+    m.add_function(wrap_pyfunction!(scatter, m)?)?;
     /*
     m.add_class::<StackedAnnData>().unwrap();
     m.add_class::<element::PyElemCollection>().unwrap();

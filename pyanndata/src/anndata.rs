@@ -335,91 +335,20 @@ pub enum LocationUpdate {
     Dir(PathBuf),
 }
 
-/// Permute an AnnData Zarr store out-of-core.
+/// Scatter matrix data from an AnnData Zarr store into one or more outputs.
 ///
-/// Reorders observations (rows) of a .zarr AnnData according to a permutation
-/// index, writing the result to a new .zarr store. Runs entirely out-of-core
-/// with bounded memory usage -- the full dataset is never loaded into RAM.
-///
-/// Parameters
-/// ----------
-/// input : str | Path
-///     Path to the source .zarr AnnData store.
-/// output : str | Path
-///     Path for the destination .zarr store (will be created).
-/// permutation : numpy.ndarray[int64]
-///     1-D array where ``permutation[i]`` is the source row index for output
-///     row ``i``. Length determines the number of output rows (can be a subset).
-/// memory_limit : int, optional
-///     Maximum RAM in bytes for internal buffers. Default is 2 GB.
-/// chunk_size : int, optional
-///     Number of rows per output sub-chunk along axis 0. When None (default),
-///     the backend picks ``min(n_rows, 128)`` for 2-D arrays.
-/// shard_size : int, optional
-///     Number of rows per output shard (outer chunk) along axis 0. Must be a
-///     multiple of ``chunk_size``. When None, defaults to ``chunk_size * 8``.
-///     Ignored when ``target_shard_bytes`` is set.
-/// target_shard_bytes : int, optional
-///     Target shard size in bytes. The engine auto-calculates the shard row
-///     count so each shard is approximately this many bytes. Set to the Lustre
-///     stripe size (e.g. ``4 * 1024 * 1024`` for 4 MB) for optimal I/O
-///     alignment. Overrides ``shard_size`` when set.
-///
-/// Examples
-/// --------
-/// >>> import numpy as np
-/// >>> import anndata_rs
-/// >>> perm = np.random.permutation(adata.n_obs).astype(np.int64)
-/// >>> anndata_rs.permute("input.zarr", "output.zarr", perm)
-/// >>> anndata_rs.permute("in.zarr", "out.zarr", perm, chunk_size=256)
-/// >>> anndata_rs.permute("in.zarr", "out.zarr", perm, shard_size=2048)
-/// >>> anndata_rs.permute("in.zarr", "out.zarr", perm, target_shard_bytes=4*1024*1024)
-#[pyfunction]
-#[pyo3(
-    signature = (input, output, permutation, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None),
-    text_signature = "(input, output, permutation, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None)",
-)]
-pub fn permute(
-    input: PathBuf,
-    output: PathBuf,
-    permutation: PyReadonlyArray1<i64>,
-    memory_limit: Option<usize>,
-    chunk_size: Option<usize>,
-    shard_size: Option<usize>,
-    target_shard_bytes: Option<usize>,
-) -> Result<()> {
-    let perm: Vec<usize> = permutation
-        .as_array()
-        .iter()
-        .map(|&v| v as usize)
-        .collect();
-
-    let config = anndata_ooc::PermuteConfig {
-        memory_limit: memory_limit.unwrap_or(2 * 1024 * 1024 * 1024),
-        chunk_size,
-        shard_size,
-        target_shard_bytes,
-    };
-
-    anndata_ooc::permute_anndata(&input, &output, &perm, &config)
-}
-
-/// Split an AnnData Zarr store by the values of an obs column.
-///
-/// Each unique value in the specified observation column becomes a separate
-/// output .zarr store under ``output_dir``. The split is performed out-of-core:
-/// the source data matrix is read once and scattered to all outputs in a single
-/// pass (per memory-budget batch).
+/// This is the low-level Rust I/O engine. It handles X, layers, obsm, obsp
+/// (the large row-indexed arrays) and copies var/uns/varm/varp unchanged.
+/// obs is NOT touched -- the caller writes obs from Python where pandas
+/// handles categoricals, nullable dtypes, etc. natively.
 ///
 /// Parameters
 /// ----------
 /// input : str | Path
 ///     Path to the source .zarr AnnData store.
-/// output_dir : str | Path
-///     Directory where output stores will be created.
-///     Each store is named ``{value}.zarr``.
-/// column : str
-///     Name of the obs column to split by.
+/// outputs : list of (str | Path, ndarray[int64])
+///     Each entry is ``(output_path, indices)`` where ``indices`` is a 1-D
+///     int64 array of source row indices.
 /// memory_limit : int, optional
 ///     Maximum RAM in bytes for internal buffers. Default is 2 GB.
 /// chunk_size : int, optional
@@ -428,32 +357,20 @@ pub fn permute(
 ///     Number of rows per output shard along axis 0.
 /// target_shard_bytes : int, optional
 ///     Target shard size in bytes. Overrides ``shard_size`` when set.
-///
-/// Returns
-/// -------
-/// list of (str, str)
-///     List of (column_value, output_path) pairs for each group.
-///
-/// Examples
-/// --------
-/// >>> import anndata_rs
-/// >>> groups = anndata_rs.split("input.zarr", "splits/", "cell_type")
-/// >>> for value, path in groups:
-/// ...     print(f"{value} -> {path}")
 #[pyfunction]
 #[pyo3(
-    signature = (input, output_dir, column, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None),
-    text_signature = "(input, output_dir, column, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None)",
+    name = "_scatter",
+    signature = (input, outputs, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None),
+    text_signature = "(input, outputs, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None)",
 )]
-pub fn split(
+pub fn scatter(
     input: PathBuf,
-    output_dir: PathBuf,
-    column: String,
+    outputs: Vec<(PathBuf, PyReadonlyArray1<i64>)>,
     memory_limit: Option<usize>,
     chunk_size: Option<usize>,
     shard_size: Option<usize>,
     target_shard_bytes: Option<usize>,
-) -> Result<Vec<(String, String)>> {
+) -> Result<()> {
     let config = anndata_ooc::ScatterConfig {
         memory_limit: memory_limit.unwrap_or(2 * 1024 * 1024 * 1024),
         chunk_size,
@@ -461,9 +378,23 @@ pub fn split(
         target_shard_bytes,
     };
 
-    let results = anndata_ooc::split_anndata(&input, &output_dir, &column, &config)?;
+    let mut assignments: Vec<anndata_ooc::RowAssignment> = Vec::new();
+    let mut output_configs: Vec<anndata_ooc::OutputStoreConfig> = Vec::new();
 
-    Ok(results.into_iter().map(|(val, path)| {
-        (val, path.display().to_string())
-    }).collect())
+    for (store_id, (path, indices)) in outputs.iter().enumerate() {
+        let idx: Vec<usize> = indices.as_array().iter().map(|&v| v as usize).collect();
+        output_configs.push(anndata_ooc::OutputStoreConfig {
+            path: path.clone(),
+            n_rows: idx.len(),
+        });
+        for (output_row, source_row) in idx.into_iter().enumerate() {
+            assignments.push(anndata_ooc::RowAssignment {
+                source_row,
+                store_id: store_id as u16,
+                output_row,
+            });
+        }
+    }
+
+    anndata_ooc::scatter_anndata(&input, &output_configs, &assignments, &config)
 }

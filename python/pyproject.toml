@@ -4,7 +4,8 @@ build-backend = "maturin"
 
 [tool.maturin]
 features = ["extension-module"]
-module-name = "anndata_rs"
+module-name = "anndata_rs.anndata_rs"
+python-source = "."
 
 [project]
 name = "anndata_rs"
