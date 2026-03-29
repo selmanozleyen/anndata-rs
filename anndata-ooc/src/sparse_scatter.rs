@@ -107,7 +107,7 @@ impl SparseScatterer {
         S: ReadableWritableListableStorageTraits + ?Sized + 'static,
     {
         // Merge nearby source rows into larger reads
-        let merged = merge_sparse_reads(batch_assigns, src_indptr, 512);
+        let merged = merge_sparse_reads(batch_assigns, src_indptr, 8192);
 
         // Read all needed source data into a lookup
         let mut row_map: std::collections::HashMap<usize, (Vec<u8>, Vec<u8>)> =

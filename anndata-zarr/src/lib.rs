@@ -594,6 +594,12 @@ fn new_empty_dataset_helper<T: BackendData, S: ?Sized>(
         }
     };
 
+    let zstd_level: i32 = match config.compression {
+        Some(anndata::backend::Compression::Zst(level)) => level as i32,
+        Some(anndata::backend::Compression::Gzip(_)) => 3,
+        None => 0,
+    };
+
     let use_sharding = !datatype.is::<StringDataType>();
 
     let array_shape: Vec<u64> = shape_ref.iter().map(|x| *x as u64).collect();
@@ -603,24 +609,28 @@ fn new_empty_dataset_helper<T: BackendData, S: ?Sized>(
             Some(s) => s.as_ref().iter().map(|x| (*x).max(1) as u64).collect(),
             None => chunk_size.iter().map(|&x| x * 8).collect(),
         };
-        zarrs::array::ArrayBuilder::new(
+        let mut builder = zarrs::array::ArrayBuilder::new(
             array_shape,
             shard_shape,
             datatype,
             fill,
-        )
-        .subchunk_shape(chunk_size)
-        .bytes_to_bytes_codecs(vec![Arc::new(ZstdCodec::new(7, false))])
-        .build(store, path)?
+        );
+        builder.subchunk_shape(chunk_size);
+        if zstd_level > 0 {
+            builder.bytes_to_bytes_codecs(vec![Arc::new(ZstdCodec::new(zstd_level, false))]);
+        }
+        builder.build(store, path)?
     } else {
-        zarrs::array::ArrayBuilder::new(
+        let mut builder = zarrs::array::ArrayBuilder::new(
             array_shape,
             chunk_size,
             datatype,
             fill,
-        )
-        .bytes_to_bytes_codecs(vec![Arc::new(ZstdCodec::new(7, false))])
-        .build(store, path)?
+        );
+        if zstd_level > 0 {
+            builder.bytes_to_bytes_codecs(vec![Arc::new(ZstdCodec::new(zstd_level, false))]);
+        }
+        builder.build(store, path)?
     };
 
     Ok(array)

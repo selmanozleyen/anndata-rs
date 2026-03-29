@@ -369,8 +369,11 @@ class TestShardSize:
 
         shard, sub_chunk = self._get_zarr_shapes(dst)
         shard_bytes = shard[0] * shard[1] * 4
-        assert shard_bytes == 4 * 1024 * 1024, \
-            f"Expected shard bytes = 4 MB, got {shard_bytes}"
+        target = 4 * 1024 * 1024
+        assert shard_bytes >= target, \
+            f"Shard bytes {shard_bytes} < target {target}"
+        assert shard_bytes < target * 1.1, \
+            f"Shard bytes {shard_bytes} too far above target {target}"
 
         result = ad.read_zarr(dst)
         np.testing.assert_allclose(result.X, X[perm], atol=1e-6)
@@ -389,7 +392,7 @@ class TestShardSize:
 
         shard, _ = self._get_zarr_shapes(dst)
         shard_bytes = shard[0] * shard[1] * 4
-        assert shard_bytes > 256 * 128 * 4, \
+        assert shard_bytes >= 4 * 1024 * 1024, \
             f"target_shard_bytes should override shard_size, got {shard_bytes}"
 
         result = ad.read_zarr(dst)

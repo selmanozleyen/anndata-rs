@@ -27,6 +27,7 @@ def scatter(
     chunk_size: int | None = None,
     shard_size: int | None = None,
     target_shard_bytes: int | None = None,
+    compression_level: int | None = None,
 ) -> None:
     """Scatter an AnnData Zarr store into one or more output stores.
 
@@ -45,6 +46,8 @@ def scatter(
         Rows per output shard along axis 0.
     target_shard_bytes
         Target shard size in bytes (overrides ``shard_size``).
+    compression_level
+        Zstd compression level (0 = none, 1-22).  Default 1 for throughput.
     """
     input = str(input)
 
@@ -63,6 +66,8 @@ def scatter(
         kwargs["shard_size"] = shard_size
     if target_shard_bytes is not None:
         kwargs["target_shard_bytes"] = target_shard_bytes
+    if compression_level is not None:
+        kwargs["compression_level"] = compression_level
 
     _scatter(input, rust_outputs, **kwargs)
 

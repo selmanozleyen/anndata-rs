@@ -115,7 +115,7 @@ impl DenseScatterer {
         let reads = ScatterPlanner::source_sorted_reads(pass);
 
         // Merge contiguous source rows for large sequential reads
-        let merged_runs = merge_contiguous_source_reads(&reads, 64);
+        let merged_runs = merge_contiguous_source_reads(&reads, 256);
 
         for run in &merged_runs {
             let src_start = run.src_start as u64;
@@ -141,20 +141,14 @@ impl DenseScatterer {
             }
         }
 
-        // Flush chunk buffers in parallel -- each writes to an independent
-        // region of a (potentially different) destination store.
-        chunk_buffers.par_iter().try_for_each(|buf| -> Result<()> {
+        chunk_buffers.into_par_iter().try_for_each(|buf| -> Result<()> {
             let dst = dsts[buf.store_id as usize];
             let row_start = buf.row_start as u64;
             let row_end = (buf.row_start + buf.n_rows) as u64;
             let write_subset = ArraySubset::new_with_ranges(
                 &[row_start..row_end, 0..n_cols as u64],
             );
-
-            log::debug!("Flushing store {} rows {}..{}", buf.store_id, row_start, row_end);
-
-            let bytes = ArrayBytes::from(buf.data.clone());
-            dst.store_array_subset(&write_subset, bytes)?;
+            dst.store_array_subset(&write_subset, ArrayBytes::from(buf.data))?;
             Ok(())
         })?;
 

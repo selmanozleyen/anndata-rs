@@ -18,6 +18,10 @@ pub struct ScatterConfig {
     pub chunk_size: Option<usize>,
     pub shard_size: Option<usize>,
     pub target_shard_bytes: Option<usize>,
+    /// Zstd compression level for output arrays. ``None`` means match the
+    /// source file's compression (falls back to 3 if undetectable).
+    /// 0 = no compression.
+    pub compression_level: Option<u8>,
 }
 
 impl Default for ScatterConfig {
@@ -27,6 +31,7 @@ impl Default for ScatterConfig {
             chunk_size: None,
             shard_size: None,
             target_shard_bytes: None,
+            compression_level: None,
         }
     }
 }
@@ -51,6 +56,18 @@ pub fn scatter_anndata(
 ) -> Result<()> {
     use anndata::backend::StoreOp;
 
+    let resolved_level = config.compression_level
+        .unwrap_or_else(|| detect_source_zstd_level(src_path).unwrap_or(3));
+    let resolved_config = ResolvedScatterConfig {
+        base: config,
+        compression_level: resolved_level,
+    };
+
+    log::info!(
+        "Scatter: compression_level={} (requested={:?})",
+        resolved_level, config.compression_level
+    );
+
     let src_store: <Zarr as Backend>::Store = Zarr::open(src_path)
         .with_context(|| format!("failed to open source: {}", src_path.display()))?;
 
@@ -65,7 +82,6 @@ pub fn scatter_anndata(
     let src_items = src_store.list()?;
     let store_n_rows: Vec<usize> = outputs.iter().map(|o| o.n_rows).collect();
 
-    // Copy var, uns, varm, varp to all output stores unchanged
     for name in &["var", "uns", "varm", "varp"] {
         if src_items.contains(&name.to_string()) {
             for dst_store in &dst_stores {
@@ -74,14 +90,12 @@ pub fn scatter_anndata(
         }
     }
 
-    // Scatter X
     if src_items.contains(&"X".to_string()) {
         scatter_matrix_element(
-            &src_store, &dst_stores, "X", assignments, &store_n_rows, &pool, config,
+            &src_store, &dst_stores, "X", assignments, &store_n_rows, &pool, &resolved_config,
         )?;
     }
 
-    // Scatter obsm, obsp, layers
     for group_name in &["obsm", "obsp", "layers"] {
         if src_items.contains(&group_name.to_string()) {
             let src_group = src_store.open_group(group_name)?;
@@ -92,7 +106,7 @@ pub fn scatter_anndata(
             let children = src_group.list()?;
             for child in &children {
                 scatter_matrix_element_in_group(
-                    &src_group, &dst_groups, child, assignments, &store_n_rows, &pool, config,
+                    &src_group, &dst_groups, child, assignments, &store_n_rows, &pool, &resolved_config,
                 )?;
             }
         }
@@ -110,6 +124,54 @@ pub fn scatter_anndata(
     Ok(())
 }
 
+/// Resolved config with the compression level pinned to a concrete value.
+struct ResolvedScatterConfig<'a> {
+    base: &'a ScatterConfig,
+    compression_level: u8,
+}
+
+/// Read the source X/zarr.json and extract the Zstd level from the codec chain.
+fn detect_source_zstd_level(src_path: &Path) -> Option<u8> {
+    let zarr_json = src_path.join("X").join("zarr.json");
+    let data = std::fs::read_to_string(&zarr_json).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    extract_zstd_level(&v)
+}
+
+fn extract_zstd_level(v: &serde_json::Value) -> Option<u8> {
+    // Top-level codecs array
+    if let Some(codecs) = v.get("codecs").and_then(|c| c.as_array()) {
+        for codec in codecs {
+            if let Some(level) = zstd_level_from_codec(codec) {
+                return Some(level);
+            }
+            // Sharding codec embeds sub-codecs
+            if codec.get("name").and_then(|n| n.as_str()) == Some("sharding_indexed") {
+                if let Some(sub) = codec.pointer("/configuration/codecs").and_then(|c| c.as_array()) {
+                    for sc in sub {
+                        if let Some(level) = zstd_level_from_codec(sc) {
+                            return Some(level);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn zstd_level_from_codec(codec: &serde_json::Value) -> Option<u8> {
+    let name = codec.get("name").and_then(|n| n.as_str())?;
+    if name == "zstd" {
+        let level = codec.pointer("/configuration/level")
+            .and_then(|l| l.as_i64())
+            .unwrap_or(3);
+        Some(level.clamp(0, 22) as u8)
+    } else {
+        None
+    }
+}
+
 // --- Internal functions ---
 
 fn scatter_matrix_element<G: GroupOp<Zarr>>(
@@ -119,7 +181,7 @@ fn scatter_matrix_element<G: GroupOp<Zarr>>(
     assignments: &[RowAssignment],
     store_n_rows: &[usize],
     pool: &BufferPool,
-    config: &ScatterConfig,
+    config: &ResolvedScatterConfig,
 ) -> Result<()> {
     scatter_matrix_element_in_group(src_store, dst_stores, name, assignments, store_n_rows, pool, config)
 }
@@ -131,7 +193,7 @@ fn scatter_matrix_element_in_group<G: GroupOp<Zarr>>(
     assignments: &[RowAssignment],
     store_n_rows: &[usize],
     pool: &BufferPool,
-    config: &ScatterConfig,
+    config: &ResolvedScatterConfig,
 ) -> Result<()> {
     use anndata::backend::DataContainer;
 
@@ -180,7 +242,7 @@ fn scatter_dense_dataset<G: GroupOp<Zarr>>(
     store_n_rows: &[usize],
     scalar_type: ScalarType,
     pool: &BufferPool,
-    config: &ScatterConfig,
+    config: &ResolvedScatterConfig,
 ) -> Result<()> {
     let src_ds = src_group.open_dataset(name)?;
     let src_shape = src_ds.shape();
@@ -192,7 +254,8 @@ fn scatter_dense_dataset<G: GroupOp<Zarr>>(
 
         let mut ds = dst_group.new_empty_dataset_typed_configured(
             name, scalar_type, &out_shape.into(),
-            config.chunk_size, config.shard_size, config.target_shard_bytes,
+            config.base.chunk_size, config.base.shard_size, config.base.target_shard_bytes,
+            Some(config.compression_level),
         )?;
         copy_encoding_attrs(&src_ds, &mut ds)?;
         dst_datasets.push(ds);
@@ -213,7 +276,7 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
     store_n_rows: &[usize],
     scalar_type: ScalarType,
     pool: &BufferPool,
-    _config: &ScatterConfig,
+    _config: &ResolvedScatterConfig,
 ) -> Result<()> {
     let src_g = src_group.open_group(name)?;
     let shape_attr: Vec<u64> = src_g.get_attr("shape")?;
@@ -389,7 +452,7 @@ trait GroupOpExt<B: Backend>: GroupOp<B> {
         dtype: ScalarType,
         shape: &anndata::data::slice::Shape,
     ) -> Result<B::Dataset> {
-        self.new_empty_dataset_typed_configured(name, dtype, shape, None, None, None)
+        self.new_empty_dataset_typed_configured(name, dtype, shape, None, None, None, None)
     }
 
     fn new_empty_dataset_typed_configured(
@@ -400,59 +463,60 @@ trait GroupOpExt<B: Backend>: GroupOp<B> {
         chunk_size: Option<usize>,
         shard_size: Option<usize>,
         target_shard_bytes: Option<usize>,
+        compression_level: Option<u8>,
     ) -> Result<B::Dataset> {
         let mut config = anndata::backend::get_default_write_config();
+        if let Some(level) = compression_level {
+            config.compression = if level == 0 {
+                None
+            } else {
+                Some(anndata::backend::Compression::Zst(level))
+            };
+        }
         let ndim = shape.ndim();
+        let shape_ref = shape.as_ref();
 
-        let block = if let Some(cs) = chunk_size {
-            let mut b: Vec<usize> = shape.as_ref().to_vec();
-            b[0] = cs.min(b[0]);
-            for dim in b.iter_mut().skip(1) {
-                *dim = (*dim).min(if ndim == 1 { 16384 } else { 128 }).max(1);
-            }
-            Some(b)
+        // Sub-chunk: use full column width (only partition along axis 0).
+        // For scatter workloads, splitting columns creates many tiny Zstd
+        // frames which kills throughput.
+        let default_chunk_rows = if ndim == 1 {
+            shape_ref[0].min(16384).max(1)
         } else {
-            None
+            chunk_size.unwrap_or(1024).min(shape_ref[0]).max(1)
         };
 
-        if let Some(ref b) = block {
-            config.block_size = Some(b.clone().into());
-        }
+        let mut block: Vec<usize> = shape_ref.to_vec();
+        block[0] = if let Some(cs) = chunk_size {
+            cs.min(shape_ref[0]).max(1)
+        } else {
+            default_chunk_rows
+        };
+        config.block_size = Some(block.clone().into());
 
-        if target_shard_bytes.is_some() || shard_size.is_some() {
-            let chunk_rows = block.as_ref()
-                .map(|b| b[0])
-                .unwrap_or_else(|| shape.as_ref()[0].min(if ndim == 1 { 16384 } else { 128 }).max(1));
+        // Shard: default to 8x sub-chunk rows, or use explicit config.
+        let chunk_rows = block[0];
+        let elem_size = scalar_type_elem_size(dtype);
+        let full_cols: usize = block.iter().skip(1).product::<usize>().max(1);
 
-            let shard_rows = if let Some(target_bytes) = target_shard_bytes {
-                let elem_size = scalar_type_elem_size(dtype);
-                let shard_cols: usize = block.as_ref()
-                    .map(|b| b.iter().skip(1).product::<usize>().max(1))
-                    .unwrap_or_else(|| {
-                        shape.as_ref().iter().skip(1)
-                            .map(|&x| x.min(if ndim == 1 { 16384 } else { 128 }).max(1))
-                            .product::<usize>().max(1)
-                    });
-                let row_bytes = shard_cols * elem_size;
-                let raw_rows = if row_bytes > 0 { target_bytes / row_bytes } else { chunk_rows };
-                let raw_rows = raw_rows.max(chunk_rows);
-                round_up_to(raw_rows, chunk_rows)
+        let n_rows = shape_ref[0];
+        let shard_rows = if let Some(target_bytes) = target_shard_bytes {
+            let row_bytes = full_cols * elem_size;
+            let raw = if row_bytes > 0 { target_bytes / row_bytes } else { chunk_rows };
+            round_up_to(raw.max(chunk_rows), chunk_rows)
+        } else if let Some(ss) = shard_size {
+            round_up_to(ss.max(chunk_rows), chunk_rows)
+        } else {
+            let ideal = chunk_rows * 8;
+            if ideal >= n_rows {
+                round_up_to(n_rows, chunk_rows)
             } else {
-                shard_size.unwrap()
-            };
+                ideal
+            }
+        };
 
-            let mut shard: Vec<usize> = block.as_ref()
-                .cloned()
-                .unwrap_or_else(|| {
-                    if ndim == 1 {
-                        vec![shape.as_ref()[0].min(16384).max(1)]
-                    } else {
-                        shape.as_ref().iter().map(|&x| x.min(128).max(1)).collect()
-                    }
-                });
-            shard[0] = shard_rows;
-            config.shard_size = Some(shard.into());
-        }
+        let mut shard = block.clone();
+        shard[0] = shard_rows;
+        config.shard_size = Some(shard.into());
 
         macro_rules! dispatch {
             ($($variant:ident => $ty:ty),+ $(,)?) => {

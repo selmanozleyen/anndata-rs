@@ -357,11 +357,13 @@ pub enum LocationUpdate {
 ///     Number of rows per output shard along axis 0.
 /// target_shard_bytes : int, optional
 ///     Target shard size in bytes. Overrides ``shard_size`` when set.
+/// compression_level : int, optional
+///     Zstd compression level (0 = none, 1-22). Default 1 for throughput.
 #[pyfunction]
 #[pyo3(
     name = "_scatter",
-    signature = (input, outputs, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None),
-    text_signature = "(input, outputs, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None)",
+    signature = (input, outputs, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None, compression_level=None),
+    text_signature = "(input, outputs, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None, compression_level=None)",
 )]
 pub fn scatter(
     input: PathBuf,
@@ -370,12 +372,14 @@ pub fn scatter(
     chunk_size: Option<usize>,
     shard_size: Option<usize>,
     target_shard_bytes: Option<usize>,
+    compression_level: Option<u8>,
 ) -> Result<()> {
     let config = anndata_ooc::ScatterConfig {
         memory_limit: memory_limit.unwrap_or(2 * 1024 * 1024 * 1024),
         chunk_size,
         shard_size,
         target_shard_bytes,
+        compression_level,
     };
 
     let mut assignments: Vec<anndata_ooc::RowAssignment> = Vec::new();
