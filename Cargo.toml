@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-anndata = { path = "anndata" }
+anndata = { path = "anndata", default-features = false }
 anndata-hdf5 = { path = "anndata-hdf5" }
 anndata-zarr = { path = "anndata-zarr" }
 anndata-ooc = { path = "anndata-ooc" }

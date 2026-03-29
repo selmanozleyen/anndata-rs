@@ -16,3 +16,4 @@ _autosummary
 *.egg-info
 __pycache__
 *.so
+data

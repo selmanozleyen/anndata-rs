@@ -13,6 +13,7 @@ use crate::{
 
 use anyhow::{Result, anyhow};
 use ndarray::{Array, Array1, ArrayD, ArrayView, Axis, Dimension, RemoveAxis, SliceInfoElem};
+#[cfg(feature = "polars")]
 use polars::series::Series;
 use std::collections::HashMap;
 use std::ops::Index;
@@ -169,6 +170,7 @@ pub struct CategoricalArray {
     pub categories: Array1<String>,
 }
 
+#[cfg(feature = "polars")]
 impl TryInto<Series> for CategoricalArray {
     type Error = anyhow::Error;
 

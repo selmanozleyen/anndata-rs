@@ -10,6 +10,7 @@ use crate::{
 };
 
 use anyhow::{bail, ensure, Context, Result};
+#[cfg(feature = "polars")]
 use polars::prelude::DataFrame;
 use smallvec::SmallVec;
 
@@ -64,14 +65,18 @@ pub trait AnnDataOp {
     fn var_ix<'a, I: IntoIterator<Item = &'a str>>(&self, names: I) -> Result<Vec<usize>>;
 
     /// Reads the observation annotations.
+    #[cfg(feature = "polars")]
     fn read_obs(&self) -> Result<DataFrame>;
     /// Reads the variable annotations.
+    #[cfg(feature = "polars")]
     fn read_var(&self) -> Result<DataFrame>;
 
     /// Changes the observation annotations.
+    #[cfg(feature = "polars")]
     fn set_obs(&self, obs: DataFrame) -> Result<()>;
 
     /// Changes the variable annotations.
+    #[cfg(feature = "polars")]
     fn set_var(&self, var: DataFrame) -> Result<()>;
 
     /// Deletes the observation annotations.

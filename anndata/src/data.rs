@@ -13,6 +13,7 @@ use anyhow::{bail, Ok, Result};
 use nalgebra_sparse::csc::CscMatrix;
 use nalgebra_sparse::csr::CsrMatrix;
 use ndarray::{Array, RemoveAxis};
+#[cfg(feature = "polars")]
 use polars::frame::DataFrame;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +30,7 @@ impl<T: Clone + Into<Data>> From<&T> for Data {
     }
 }
 
+#[cfg(feature = "polars")]
 impl From<DataFrame> for Data {
     fn from(data: DataFrame) -> Self {
         Data::ArrayData(ArrayData::DataFrame(data))
@@ -118,6 +120,7 @@ impl_try_from_for_scalar!(
     Bool, bool, String, String
 );
 
+#[cfg(feature = "polars")]
 impl TryFrom<Data> for DataFrame {
     type Error = anyhow::Error;
 

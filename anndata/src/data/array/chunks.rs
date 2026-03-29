@@ -266,6 +266,7 @@ impl ArrayChunk for ArrayData {
             ArrayData::CscMatrix(_) => {
                 DynCscMatrix::write_by_chunk(iter.map(|x| x.try_into().unwrap()), location, name)
             }
+            #[cfg(feature = "polars")]
             ArrayData::DataFrame(_) => todo!(),
         }
     }

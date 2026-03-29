@@ -10,6 +10,7 @@ use anyhow::{bail, ensure, Result};
 use ndarray::{arr0, Array, ArrayD, ArrayView, CowArray, Dimension, IxDyn};
 use num::NumCast;
 use paste::paste;
+#[cfg(feature = "polars")]
 use polars::series::Series;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -194,6 +195,7 @@ impl_dynarray_traits!(
     bool, Bool, String, String
 );
 
+#[cfg(feature = "polars")]
 impl Into<Series> for DynArray {
     fn into(self) -> Series {
         match self {

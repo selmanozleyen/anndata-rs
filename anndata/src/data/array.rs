@@ -1,12 +1,14 @@
 mod chunks;
+#[cfg(feature = "polars")]
 pub mod dataframe;
+pub mod df_index;
 mod dense;
 pub mod slice;
 mod sparse;
 pub mod utils;
 
 pub use chunks::{MatrixBuilder, ArrayChunk};
-pub use dataframe::DataFrameIndex;
+pub use df_index::DataFrameIndex;
 pub use dense::{ArrayConvert, CategoricalArray, DynArray, DynCowArray, DynScalar};
 pub use slice::{SelectInfo, SelectInfoBounds, SelectInfoElem, SelectInfoElemBounds, Shape};
 pub use sparse::{CsrNonCanonical, DynCscMatrix, DynCsrMatrix, DynCsrNonCanonical};
@@ -19,6 +21,7 @@ use ::ndarray::{Array, ArrayD, Ix1, RemoveAxis};
 use anyhow::{bail, Result};
 use nalgebra_sparse::csc::CscMatrix;
 use nalgebra_sparse::csr::CsrMatrix;
+#[cfg(feature = "polars")]
 use polars::prelude::DataFrame;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +30,7 @@ pub enum ArrayData {
     CsrMatrix(DynCsrMatrix),
     CsrNonCanonical(DynCsrNonCanonical),
     CscMatrix(DynCscMatrix),
+    #[cfg(feature = "polars")]
     DataFrame(DataFrame),
 }
 
@@ -36,6 +40,7 @@ impl<T: Clone + Into<ArrayData>> From<&T> for ArrayData {
     }
 }
 
+#[cfg(feature = "polars")]
 impl From<DataFrame> for ArrayData {
     fn from(data: DataFrame) -> Self {
         ArrayData::DataFrame(data)
@@ -108,6 +113,7 @@ impl TryFrom<ArrayData> for DynCscMatrix {
     }
 }
 
+#[cfg(feature = "polars")]
 impl TryFrom<ArrayData> for DataFrame {
     type Error = anyhow::Error;
     fn try_from(value: ArrayData) -> Result<Self, Self::Error> {
@@ -205,6 +211,7 @@ impl Readable for ArrayData {
             }
             DataType::CsrMatrix(_) => read_csr(container),
             DataType::CscMatrix(_) => DynCscMatrix::read(container).map(ArrayData::CscMatrix),
+            #[cfg(feature = "polars")]
             DataType::DataFrame => DataFrame::read(container).map(ArrayData::DataFrame),
             ty => bail!("Cannot read type '{:?}' as matrix data", ty),
         }
@@ -218,6 +225,7 @@ impl Element for ArrayData {
             ArrayData::CsrMatrix(data) => data.data_type(),
             ArrayData::CsrNonCanonical(data) => data.data_type(),
             ArrayData::CscMatrix(data) => data.data_type(),
+            #[cfg(feature = "polars")]
             ArrayData::DataFrame(data) => data.data_type(),
         }
     }
@@ -228,6 +236,7 @@ impl Element for ArrayData {
             ArrayData::CsrMatrix(data) => data.metadata(),
             ArrayData::CsrNonCanonical(data) => data.metadata(),
             ArrayData::CscMatrix(data) => data.metadata(),
+            #[cfg(feature = "polars")]
             ArrayData::DataFrame(data) => data.metadata(),
         }
     }
@@ -244,6 +253,7 @@ impl Writable for ArrayData {
             ArrayData::CsrMatrix(data) => data.write(location, name),
             ArrayData::CsrNonCanonical(data) => data.write(location, name),
             ArrayData::CscMatrix(data) => data.write(location, name),
+            #[cfg(feature = "polars")]
             ArrayData::DataFrame(data) => data.write(location, name),
         }
     }
@@ -256,6 +266,7 @@ impl HasShape for ArrayData {
             ArrayData::CsrMatrix(data) => data.shape(),
             ArrayData::CsrNonCanonical(data) => data.shape(),
             ArrayData::CscMatrix(data) => data.shape(),
+            #[cfg(feature = "polars")]
             ArrayData::DataFrame(data) => HasShape::shape(data),
         }
     }
@@ -280,6 +291,7 @@ impl Selectable for ArrayData {
             ArrayData::CsrMatrix(data) => data.select(info).into(),
             ArrayData::CsrNonCanonical(data) => data.select(info).into(),
             ArrayData::CscMatrix(data) => data.select(info).into(),
+            #[cfg(feature = "polars")]
             ArrayData::DataFrame(data) => Selectable::select(data, info).into(),
         }
     }
@@ -308,6 +320,7 @@ impl Stackable for ArrayData {
                 DynCsrNonCanonical::vstack(iter.map(|x| x.try_into().unwrap())).map(|x| x.into())
             }
             ArrayData::CscMatrix(_) => todo!(),
+            #[cfg(feature = "polars")]
             ArrayData::DataFrame(_) => {
                 <DataFrame as Stackable>::vstack(iter.map(|x| x.try_into().unwrap()))
                     .map(|x| x.into())
@@ -323,6 +336,7 @@ impl ArrayArithmetic for ArrayData {
             ArrayData::CsrMatrix(data) => ArrayArithmetic::sum(data),
             ArrayData::CsrNonCanonical(_) => todo!(),
             ArrayData::CscMatrix(_) => todo!(),
+            #[cfg(feature = "polars")]
             ArrayData::DataFrame(_) => panic!("Cannot compute sum for DataFrame"),
         }
     }
@@ -333,6 +347,7 @@ impl ArrayArithmetic for ArrayData {
             ArrayData::CsrMatrix(data) => ArrayArithmetic::sum_axis(data, axis),
             ArrayData::CsrNonCanonical(_) => todo!(),
             ArrayData::CscMatrix(_) => todo!(),
+            #[cfg(feature = "polars")]
             ArrayData::DataFrame(_) => bail!("Cannot compute sum for DataFrame"),
         }
     }
@@ -343,6 +358,7 @@ impl ArrayArithmetic for ArrayData {
             ArrayData::CsrMatrix(data) => ArrayArithmetic::min(data),
             ArrayData::CsrNonCanonical(_) => todo!(),
             ArrayData::CscMatrix(_) => todo!(),
+            #[cfg(feature = "polars")]
             ArrayData::DataFrame(_) => panic!("Cannot compute min for DataFrame"),
         }
     }
@@ -353,6 +369,7 @@ impl ArrayArithmetic for ArrayData {
             ArrayData::CsrMatrix(data) => ArrayArithmetic::max(data),
             ArrayData::CsrNonCanonical(_) => todo!(),
             ArrayData::CscMatrix(_) => todo!(),
+            #[cfg(feature = "polars")]
             ArrayData::DataFrame(_) => panic!("Cannot compute max for DataFrame"),
         }
     }
@@ -364,6 +381,7 @@ impl ReadableArray for ArrayData {
             DataType::Categorical | DataType::Array(_) => DynArray::get_shape(container),
             DataType::CsrMatrix(_) => DynCsrMatrix::get_shape(container),
             DataType::CscMatrix(_) => DynCscMatrix::get_shape(container),
+            #[cfg(feature = "polars")]
             DataType::DataFrame => DataFrame::get_shape(container),
             ty => bail!("Cannot read shape information from type '{}'", ty),
         }
@@ -382,6 +400,7 @@ impl ReadableArray for ArrayData {
             DataType::CscMatrix(_) => {
                 DynCscMatrix::read_select(container, info).map(ArrayData::CscMatrix)
             }
+            #[cfg(feature = "polars")]
             DataType::DataFrame => {
                 DataFrame::read_select(container, info).map(ArrayData::DataFrame)
             }

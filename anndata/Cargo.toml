@@ -19,7 +19,7 @@ itertools = "0.14"
 ndarray = "0.17"
 nalgebra-sparse = "0.11"
 num = "0.4"
-polars = { version = "0.53", features = ["lazy", "ndarray", "dtype-full"] }
+polars = { version = "0.53", features = ["lazy", "ndarray", "dtype-full"], optional = true }
 paste = "1.0"
 parking_lot = "0.12"
 smallvec = "1.15"
@@ -27,6 +27,9 @@ serde = "1.0"
 serde_json = "1.0"
 rayon = "1.11"
 permutation = "0.4"
+
+[features]
+default = ["polars"]
 
 [dev-dependencies]
 tempfile = "3.2"
