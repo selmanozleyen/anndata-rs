@@ -13,8 +13,8 @@ keywords = ["data"]
 
 [dependencies]
 anndata = { workspace = true }
-anndata-hdf5 = { workspace = true, default-features = false }
-anndata-zarr = { workspace = true, default-features = false }
+anndata-hdf5 = { workspace = true }
+anndata-zarr = { workspace = true }
 anndata-ooc = { workspace = true }
 anyhow = "1.0"
 downcast-rs = "2"
