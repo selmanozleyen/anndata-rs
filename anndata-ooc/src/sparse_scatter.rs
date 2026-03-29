@@ -199,8 +199,6 @@ impl SparseScatterer {
                     &data_raw[rel_lo * data_elem_size..rel_hi * data_elem_size];
                 let src_idx_slice =
                     &indices_raw[rel_lo * indices_elem_size..rel_hi * indices_elem_size];
-                let src_nnz = hi - lo;
-
                 if let Some(targets) = src_to_dst.get(&a.source_row) {
                     for &(chunk_idx, ref entry) in targets {
                         let buf = &dst_bufs[chunk_idx];
@@ -209,35 +207,41 @@ impl SparseScatterer {
 
                         let row_nnz_start = out_indptr[entry.output_row] as usize;
                         let row_nnz_end = out_indptr[entry.output_row + 1] as usize;
-                        let row_nnz = row_nnz_end - row_nnz_start;
 
-                        if row_nnz > 0 {
-                            let offset_in_chunk = row_nnz_start - buf.nnz_start;
-                            let copy_nnz = src_nnz.min(row_nnz);
+                        // Clamp the row's NNZ range to this chunk's range.
+                        // A row may span multiple destination chunks; each chunk
+                        // gets only its portion.
+                        let clamped_start = row_nnz_start.max(buf.nnz_start);
+                        let clamped_end = row_nnz_end.min(buf.nnz_end);
 
-                            let dst_data_start = offset_in_chunk * data_elem_size;
-                            let src_data_len = copy_nnz * data_elem_size;
+                        if clamped_start < clamped_end {
+                            let copy_nnz = clamped_end - clamped_start;
+                            let offset_in_chunk = clamped_start - buf.nnz_start;
+                            let skip_in_src = clamped_start - row_nnz_start;
 
-                            // Safety: each entry targets a unique output_row within
-                            // this chunk, so different entries write to disjoint
-                            // byte ranges of the buffer. The atomic counter ensures
-                            // the buffer is not read for flushing until all writes
-                            // are complete.
+                            // Safety: each (output_row, chunk) pair writes to a
+                            // unique disjoint range in the buffer. The atomic
+                            // counter ensures the buffer is not read for flushing
+                            // until all writes are complete.
                             unsafe {
                                 let data_ptr = buf.data_buf.as_ptr() as *mut u8;
+                                let src_off = skip_in_src * data_elem_size;
+                                let dst_off = offset_in_chunk * data_elem_size;
+                                let len = copy_nnz * data_elem_size;
                                 std::ptr::copy_nonoverlapping(
-                                    src_data_slice.as_ptr(),
-                                    data_ptr.add(dst_data_start),
-                                    src_data_len,
+                                    src_data_slice.as_ptr().add(src_off),
+                                    data_ptr.add(dst_off),
+                                    len,
                                 );
 
                                 let idx_ptr = buf.indices_buf.as_ptr() as *mut u8;
-                                let dst_idx_start = offset_in_chunk * indices_elem_size;
-                                let src_idx_len = copy_nnz * indices_elem_size;
+                                let src_idx_off = skip_in_src * indices_elem_size;
+                                let dst_idx_off = offset_in_chunk * indices_elem_size;
+                                let idx_len = copy_nnz * indices_elem_size;
                                 std::ptr::copy_nonoverlapping(
-                                    src_idx_slice.as_ptr(),
-                                    idx_ptr.add(dst_idx_start),
-                                    src_idx_len,
+                                    src_idx_slice.as_ptr().add(src_idx_off),
+                                    idx_ptr.add(dst_idx_off),
+                                    idx_len,
                                 );
                             }
                         }

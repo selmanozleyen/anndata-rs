@@ -221,14 +221,19 @@ impl ScatterPlanner {
             let cs = store_nnz_chunk_sizes[sid];
             if cs == 0 { continue; }
             let row_nnz_start = indptr[a.output_row] as usize;
-            let chunk_idx = (row_nnz_start / cs) as u64;
-            chunk_map
-                .entry((a.store_id, chunk_idx))
-                .or_default()
-                .push(SparseScatterEntry {
-                    source_row: a.source_row,
-                    output_row: a.output_row,
-                });
+            let row_nnz_end = indptr[a.output_row + 1] as usize;
+            if row_nnz_end <= row_nnz_start { continue; }
+            let first_chunk = row_nnz_start / cs;
+            let last_chunk = (row_nnz_end - 1) / cs;
+            for ci in first_chunk..=last_chunk {
+                chunk_map
+                    .entry((a.store_id, ci as u64))
+                    .or_default()
+                    .push(SparseScatterEntry {
+                        source_row: a.source_row,
+                        output_row: a.output_row,
+                    });
+            }
         }
 
         let mut all_chunks: Vec<SparseScatterChunk> = Vec::with_capacity(chunk_map.len());
