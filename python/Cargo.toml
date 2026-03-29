@@ -18,6 +18,8 @@ version = "0.27"
 features = ["multiple-pymethods"]
 
 [features]
+default = ["polars"]
+polars = ["pyanndata/polars"]
 extension-module = ["pyo3/extension-module", "pyanndata/extension-module"]
 
 [lib]

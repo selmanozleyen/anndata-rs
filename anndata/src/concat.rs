@@ -47,8 +47,8 @@ where
         .iter()
         .map(|x| x.var_names().into_iter().collect::<IndexSet<_>>());
     let common_vars: IndexSet<String> = match join {
-        JoinType::Inner => common_vars.reduce(|a, b| a.intersection(&b).cloned().collect()),
-        JoinType::Outer => common_vars.reduce(|a, b| a.union(&b).cloned().collect()),
+        JoinType::Inner => common_vars.reduce(|a: IndexSet<String>, b| a.intersection(&b).cloned().collect()),
+        JoinType::Outer => common_vars.reduce(|a: IndexSet<String>, b| a.union(&b).cloned().collect()),
     }
     .unwrap();
     out.set_var_names(common_vars.iter().cloned().collect())?;
@@ -247,7 +247,7 @@ fn align_series(
                 CategoricalChunkedBuilder::new(name.clone(), dtype.clone());
             new_row_names.iter().for_each(|key| {
                 let item = row_names.get_index(key).map(|i| series.get(i).unwrap());
-                if let Some(s) = item.as_ref().and_then(|x| x.get_str()) {
+                if let Some(s) = item.as_ref().and_then(|x: &AnyValue<'_>| x.get_str()) {
                     builder.append_str(s).unwrap();
                 } else {
                     builder.append_null();
