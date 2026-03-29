@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Mutex;
 
 use anyhow::{Result, bail};
 use rayon::prelude::*;
@@ -179,7 +180,6 @@ impl DenseScatterer {
         let elem_size = src.data_type().fixed_size().unwrap_or(8);
         let row_bytes = n_cols * elem_size;
 
-        // Allocate a buffer per chunk in this pass
         struct ChunkBuf {
             store_id: u16,
             row_start: usize,
@@ -187,23 +187,26 @@ impl DenseScatterer {
             data: Vec<u8>,
         }
 
-        let mut chunk_buffers: Vec<ChunkBuf> = pass.chunks.iter().map(|sc| {
-            let n_rows = sc.row_range.len();
-            ChunkBuf {
-                store_id: sc.store_id,
-                row_start: sc.row_range.start,
-                n_rows,
-                data: vec![0u8; n_rows * row_bytes],
-            }
-        }).collect();
+        let chunk_buffers: Vec<Mutex<ChunkBuf>> = pass
+            .chunks
+            .iter()
+            .map(|sc| {
+                let n_rows = sc.row_range.len();
+                Mutex::new(ChunkBuf {
+                    store_id: sc.store_id,
+                    row_start: sc.row_range.start,
+                    n_rows,
+                    data: vec![0u8; n_rows * row_bytes],
+                })
+            })
+            .collect();
 
-        // Get source-sorted reads
         let reads = ScatterPlanner::source_sorted_reads(pass);
-
-        // Merge contiguous source rows for large sequential reads
         let merged_runs = merge_contiguous_source_reads(&reads, 256);
 
-        for run in &merged_runs {
+        // Phase 1: parallel source reads -- each merged run decodes
+        // independent source ranges and scatters into chunk buffers.
+        merged_runs.par_iter().try_for_each(|run| -> Result<()> {
             let src_start = run.src_start as u64;
             let src_len = run.count as u64;
 
@@ -221,22 +224,28 @@ impl DenseScatterer {
                 let src_offset = local_src * row_bytes;
                 let src_slice = &block[src_offset..src_offset + row_bytes];
 
-                let buf = &mut chunk_buffers[pass_chunk_idx];
+                let mut buf = chunk_buffers[pass_chunk_idx].lock().unwrap();
                 let dst_offset = local_row * row_bytes;
-                buf.data[dst_offset..dst_offset + row_bytes].copy_from_slice(src_slice);
+                buf.data[dst_offset..dst_offset + row_bytes]
+                    .copy_from_slice(src_slice);
             }
-        }
-
-        chunk_buffers.into_par_iter().try_for_each(|buf| -> Result<()> {
-            let dst = dsts[buf.store_id as usize];
-            let row_start = buf.row_start as u64;
-            let row_end = (buf.row_start + buf.n_rows) as u64;
-            let write_subset = ArraySubset::new_with_ranges(
-                &[row_start..row_end, 0..n_cols as u64],
-            );
-            dst.store_array_subset(&write_subset, ArrayBytes::from(buf.data))?;
             Ok(())
         })?;
+
+        // Flush chunk buffers in parallel (writes to distinct chunks)
+        chunk_buffers
+            .into_par_iter()
+            .try_for_each(|buf_lock| -> Result<()> {
+                let buf = buf_lock.into_inner().unwrap();
+                let dst = dsts[buf.store_id as usize];
+                let row_start = buf.row_start as u64;
+                let row_end = (buf.row_start + buf.n_rows) as u64;
+                let write_subset = ArraySubset::new_with_ranges(
+                    &[row_start..row_end, 0..n_cols as u64],
+                );
+                dst.store_array_subset(&write_subset, ArrayBytes::from(buf.data))?;
+                Ok(())
+            })?;
 
         Ok(())
     }

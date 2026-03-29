@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::sync::Mutex;
 
 use anyhow::Result;
 use rayon::prelude::*;
@@ -58,71 +58,14 @@ impl SparseScatterer {
             usize::MAX
         };
 
-        // Attempt NNZ-chunk passthrough for identity-mapped prefix.
-        // For 1D arrays, store_encoded_chunk writes the raw blob for
-        // one storage key (= one shard when sharding is active).
-        // We only copy a shard if its entire NNZ range falls within the
-        // identity prefix so the scatter path never touches the same shard.
-        let mut passthrough_data_chunks = 0usize;
-        let mut passthrough_indices_chunks = 0usize;
-        let mut passthrough_rows: HashSet<(u16, usize)> = HashSet::new();
+        // Sparse 1D passthrough is disabled: sharded 1D arrays encode shard
+        // shape into the blob, so copying a shard between arrays of different
+        // total length produces an invalid shard even when the sub-chunk data
+        // is identical. Dense 2D passthrough (the high-value path for X)
+        // handles the outer chunk grid where shapes match.
+        let _ = passthrough_possible;
 
-        if passthrough_possible {
-            let identity_set = build_sparse_identity_set(assignments);
-
-            for (store_id, store) in stores.iter().enumerate() {
-                let sid = store_id as u16;
-                let out_indptr = &store.out_indptr;
-
-                let mut prefix_end = 0usize;
-                let n_out_rows = out_indptr.len().saturating_sub(1);
-                for r in 0..n_out_rows {
-                    if identity_set.contains(&(sid, r)) {
-                        prefix_end = r + 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                if prefix_end == 0 {
-                    continue;
-                }
-
-                let identity_nnz_end = src_indptr[prefix_end] as usize;
-
-                let dc = passthrough_1d_chunks(
-                    src_data, store.dst_data, identity_nnz_end,
-                )?;
-                passthrough_data_chunks += dc;
-
-                let ic = passthrough_1d_chunks(
-                    src_indices, store.dst_indices, identity_nnz_end,
-                )?;
-                passthrough_indices_chunks += ic;
-
-                for r in 0..prefix_end {
-                    passthrough_rows.insert((sid, r));
-                }
-            }
-        }
-
-        log::info!(
-            "SparseScatterer: {} stores, {} assignments, passthrough: {} data chunks, {} indices chunks",
-            stores.len(), assignments.len(), passthrough_data_chunks, passthrough_indices_chunks
-        );
-
-        let effective_assignments: Vec<&RowAssignment> = if passthrough_rows.is_empty() {
-            assignments.iter().collect()
-        } else {
-            assignments.iter()
-                .filter(|a| !passthrough_rows.contains(&(a.store_id, a.output_row)))
-                .collect()
-        };
-
-        if effective_assignments.is_empty() {
-            log::info!("SparseScatterer: all rows handled via passthrough");
-            return Ok(());
-        }
+        let effective_assignments: Vec<&RowAssignment> = assignments.iter().collect();
 
         // Sort assignments by source indptr position for sequential reads
         let mut sorted_assigns: Vec<&RowAssignment> = effective_assignments;
@@ -176,51 +119,71 @@ impl SparseScatterer {
     where
         S: ReadableWritableListableStorageTraits + ?Sized + 'static,
     {
-        // Merge nearby source rows into larger reads
         let merged = merge_sparse_reads(batch_assigns, src_indptr, 8192);
 
-        // Read all needed source data into a lookup
-        let mut row_map: std::collections::HashMap<usize, (Vec<u8>, Vec<u8>)> =
-            std::collections::HashMap::with_capacity(batch_assigns.len());
-
-        for run in &merged {
-            if run.nnz_end <= run.nnz_start {
-                continue;
-            }
-
-            let subset = ArraySubset::new_with_ranges(
-                &[run.nnz_start as u64..run.nnz_end as u64],
+        // Phase 1: parallel merged reads -- each run covers a disjoint NNZ
+        // range so decodes are independent and can saturate all cores.
+        let row_map = {
+            let map = Mutex::new(
+                std::collections::HashMap::<usize, (Vec<u8>, Vec<u8>)>::with_capacity(
+                    batch_assigns.len(),
+                ),
             );
-
-            let data_bytes: ArrayBytes<'static> = src_data.retrieve_array_subset(&subset)?;
-            let data_raw = data_bytes.into_fixed()?.into_owned();
-            let indices_bytes: ArrayBytes<'static> = src_indices.retrieve_array_subset(&subset)?;
-            let indices_raw = indices_bytes.into_fixed()?.into_owned();
-
-            for a in &run.assignments {
-                let lo = src_indptr[a.source_row] as usize;
-                let hi = src_indptr[a.source_row + 1] as usize;
-                if hi <= lo {
-                    continue;
+            merged.par_iter().try_for_each(|run| -> Result<()> {
+                if run.nnz_end <= run.nnz_start {
+                    return Ok(());
                 }
-                let rel_lo = lo - run.nnz_start;
-                let rel_hi = hi - run.nnz_start;
 
-                let d = data_raw[rel_lo * data_elem_size..rel_hi * data_elem_size].to_vec();
-                let i = indices_raw[rel_lo * indices_elem_size..rel_hi * indices_elem_size].to_vec();
-                row_map.insert(a.source_row, (d, i));
-            }
-        }
+                let subset = ArraySubset::new_with_ranges(
+                    &[run.nnz_start as u64..run.nnz_end as u64],
+                );
 
-        // Group batch assignments by store_id, then write each store in parallel
+                let data_bytes: ArrayBytes<'static> =
+                    src_data.retrieve_array_subset(&subset)?;
+                let data_raw = data_bytes.into_fixed()?.into_owned();
+                let indices_bytes: ArrayBytes<'static> =
+                    src_indices.retrieve_array_subset(&subset)?;
+                let indices_raw = indices_bytes.into_fixed()?.into_owned();
+
+                let mut local: Vec<(usize, Vec<u8>, Vec<u8>)> =
+                    Vec::with_capacity(run.assignments.len());
+
+                for a in &run.assignments {
+                    let lo = src_indptr[a.source_row] as usize;
+                    let hi = src_indptr[a.source_row + 1] as usize;
+                    if hi <= lo {
+                        continue;
+                    }
+                    let rel_lo = lo - run.nnz_start;
+                    let rel_hi = hi - run.nnz_start;
+
+                    let d = data_raw[rel_lo * data_elem_size..rel_hi * data_elem_size]
+                        .to_vec();
+                    let i = indices_raw
+                        [rel_lo * indices_elem_size..rel_hi * indices_elem_size]
+                        .to_vec();
+                    local.push((a.source_row, d, i));
+                }
+
+                let mut guard = map.lock().unwrap();
+                for (src_row, d, i) in local {
+                    guard.insert(src_row, (d, i));
+                }
+                Ok(())
+            })?;
+            map.into_inner().unwrap()
+        };
+
+        // Group batch assignments by store_id
         let n_stores = stores.len();
         let mut per_store: Vec<Vec<&RowAssignment>> = vec![Vec::new(); n_stores];
         for a in batch_assigns {
             per_store[a.store_id as usize].push(a);
         }
 
-        // Assemble and flush each store's portion in parallel -- each store
-        // writes to independent arrays so there are no data races.
+        // Phase 2: parallel writes -- within each store, group output runs
+        // by destination zarr chunk and parallelize across chunks. Writes to
+        // distinct chunks touch independent files so there are no data races.
         per_store.par_iter().enumerate().try_for_each(
             |(store_id, store_assigns)| -> Result<()> {
                 if store_assigns.is_empty() {
@@ -234,117 +197,56 @@ impl SparseScatterer {
                     &sorted, &stores[store_id].out_indptr,
                 );
 
-                for run in &runs {
-                    let dst_nnz_start = stores[store_id].out_indptr[run.out_start] as usize;
-                    let dst_nnz_end = stores[store_id].out_indptr[run.out_end] as usize;
-                    let total_nnz = dst_nnz_end - dst_nnz_start;
-                    if total_nnz == 0 {
-                        continue;
-                    }
+                let dst_data = stores[store_id].dst_data;
+                let dst_indices = stores[store_id].dst_indices;
+                let out_indptr = &stores[store_id].out_indptr;
 
-                    let mut assembled_data = Vec::with_capacity(total_nnz * data_elem_size);
-                    let mut assembled_indices = Vec::with_capacity(total_nnz * indices_elem_size);
+                let chunk_groups = group_output_runs_by_dst_chunk(
+                    &runs, out_indptr, dst_data,
+                );
 
-                    for out_row in run.out_start..run.out_end {
-                        let src_row = run.assignments_by_out[&out_row];
-                        if let Some((d, i)) = row_map.get(&src_row) {
-                            assembled_data.extend_from_slice(d);
-                            assembled_indices.extend_from_slice(i);
+                chunk_groups.par_iter().try_for_each(|group| -> Result<()> {
+                    for run_idx in &group.run_indices {
+                        let run = &runs[*run_idx];
+                        let dst_nnz_start = out_indptr[run.out_start] as usize;
+                        let dst_nnz_end = out_indptr[run.out_end] as usize;
+                        let total_nnz = dst_nnz_end - dst_nnz_start;
+                        if total_nnz == 0 {
+                            continue;
                         }
-                    }
 
-                    let write_subset = ArraySubset::new_with_ranges(
-                        &[dst_nnz_start as u64..dst_nnz_end as u64],
-                    );
-                    stores[store_id].dst_data.store_array_subset(
-                        &write_subset, ArrayBytes::from(assembled_data),
-                    )?;
-                    stores[store_id].dst_indices.store_array_subset(
-                        &write_subset, ArrayBytes::from(assembled_indices),
-                    )?;
-                }
-                Ok(())
+                        let mut assembled_data =
+                            Vec::with_capacity(total_nnz * data_elem_size);
+                        let mut assembled_indices =
+                            Vec::with_capacity(total_nnz * indices_elem_size);
+
+                        for out_row in run.out_start..run.out_end {
+                            let src_row = run.assignments_by_out[&out_row];
+                            if let Some((d, i)) = row_map.get(&src_row) {
+                                assembled_data.extend_from_slice(d);
+                                assembled_indices.extend_from_slice(i);
+                            }
+                        }
+
+                        let write_subset = ArraySubset::new_with_ranges(
+                            &[dst_nnz_start as u64..dst_nnz_end as u64],
+                        );
+                        dst_data.store_array_subset(
+                            &write_subset,
+                            ArrayBytes::from(assembled_data),
+                        )?;
+                        dst_indices.store_array_subset(
+                            &write_subset,
+                            ArrayBytes::from(assembled_indices),
+                        )?;
+                    }
+                    Ok(())
+                })
             },
         )?;
 
         Ok(())
     }
-}
-
-/// Copy 1D encoded chunks from src to dst whose entire storage key
-/// (shard/chunk) falls within [0, identity_nnz_end).
-///
-/// For non-sharded arrays each chunk is one file, so we copy any chunk
-/// fully within the identity range. For sharded arrays each storage key
-/// covers `shard_size` elements; we only copy when the whole shard is
-/// within the identity range to avoid conflicts with store_array_subset.
-fn passthrough_1d_chunks<S>(
-    src: &Array<S>,
-    dst: &Array<S>,
-    identity_nnz_end: usize,
-) -> Result<usize>
-where
-    S: ReadableWritableListableStorageTraits + ?Sized + 'static,
-{
-    let src_grid = src.chunk_grid_shape();
-    let dst_grid = dst.chunk_grid_shape();
-
-    if src_grid.is_empty() || dst_grid.is_empty() {
-        return Ok(0);
-    }
-
-    let src_cs = src.chunk_shape(&[0u64])?.iter().map(|s| s.get()).next().unwrap_or(0);
-    let dst_cs = dst.chunk_shape(&[0u64])?.iter().map(|s| s.get()).next().unwrap_or(0);
-
-    if src_cs != dst_cs || src_cs == 0 {
-        return Ok(0);
-    }
-
-    // chunk_size here is the outer grid unit -- for sharded arrays this is
-    // the shard size, so one retrieve_encoded_chunk / store_encoded_chunk
-    // touches exactly one storage key with no overlap.
-    let chunk_size = src_cs as usize;
-    let mut copied = 0usize;
-
-    let n_src_chunks = src_grid[0];
-    let n_dst_chunks = dst_grid[0];
-
-    for chunk_idx in 0..n_src_chunks.min(n_dst_chunks) {
-        let chunk_start = chunk_idx as usize * chunk_size;
-        let chunk_end = chunk_start + chunk_size;
-
-        if chunk_end > identity_nnz_end {
-            break;
-        }
-
-        let indices = vec![chunk_idx];
-        if let Some(encoded) = src.retrieve_encoded_chunk(&indices)? {
-            unsafe {
-                dst.store_encoded_chunk(
-                    &indices,
-                    bytes::Bytes::from(encoded),
-                )?;
-            }
-            copied += 1;
-        }
-    }
-
-    log::debug!(
-        "passthrough_1d_chunks: copied {} of {} chunks (identity_nnz={})",
-        copied, n_src_chunks, identity_nnz_end
-    );
-    Ok(copied)
-}
-
-/// Build a set of (store_id, row) pairs where source_row == output_row.
-fn build_sparse_identity_set(assignments: &[RowAssignment]) -> HashSet<(u16, usize)> {
-    let mut set = HashSet::with_capacity(assignments.len());
-    for a in assignments {
-        if a.source_row == a.output_row {
-            set.insert((a.store_id, a.output_row));
-        }
-    }
-    set
 }
 
 struct MergedSparseRun<'a> {
@@ -400,6 +302,57 @@ struct OutputRun {
     out_start: usize,
     out_end: usize,
     assignments_by_out: std::collections::HashMap<usize, usize>,
+}
+
+struct ChunkGroup {
+    run_indices: Vec<usize>,
+}
+
+/// Group output runs so that runs targeting the same destination zarr chunk
+/// are in the same group. Runs in different groups touch disjoint chunks
+/// and can safely be written in parallel.
+fn group_output_runs_by_dst_chunk<S>(
+    runs: &[OutputRun],
+    out_indptr: &[i64],
+    dst_data: &Array<S>,
+) -> Vec<ChunkGroup>
+where
+    S: ReadableWritableListableStorageTraits + ?Sized + 'static,
+{
+    let chunk_size = dst_data
+        .chunk_grid_shape()
+        .first()
+        .and_then(|&n| {
+            if n == 0 {
+                None
+            } else {
+                dst_data
+                    .chunk_shape(&[0u64])
+                    .ok()
+                    .and_then(|s| s.first().map(|c| c.get() as usize))
+            }
+        })
+        .unwrap_or(usize::MAX);
+
+    let mut chunk_map: std::collections::BTreeMap<u64, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (run_idx, run) in runs.iter().enumerate() {
+        let nnz_start = out_indptr[run.out_start] as u64;
+        let nnz_end = out_indptr[run.out_end] as u64;
+        if nnz_end <= nnz_start {
+            continue;
+        }
+        let first_chunk = nnz_start / chunk_size as u64;
+        let last_chunk = (nnz_end - 1) / chunk_size as u64;
+        for c in first_chunk..=last_chunk {
+            chunk_map.entry(c).or_default().push(run_idx);
+        }
+    }
+
+    chunk_map
+        .into_values()
+        .map(|run_indices| ChunkGroup { run_indices })
+        .collect()
 }
 
 fn find_contiguous_output_runs(
