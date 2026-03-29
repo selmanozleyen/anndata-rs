@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::Result;
 use rayon::prelude::*;
 use zarrs::array::{Array, ArrayBytes, ArraySubset};
@@ -32,6 +34,7 @@ impl SparseScatterer {
     /// `assignments` maps source rows to (store_id, output_row).
     /// `stores[i]` holds the destination arrays and indptr for store i.
     /// `src_indptr` is the full source indptr (already in memory).
+    /// `passthrough_possible` indicates src and dst share chunk/codec config.
     pub fn scatter_data_indices<S>(
         &self,
         src_indices: &Array<S>,
@@ -39,6 +42,7 @@ impl SparseScatterer {
         stores: &[SparseStoreArrays<'_, S>],
         assignments: &[RowAssignment],
         src_indptr: &[i64],
+        passthrough_possible: bool,
     ) -> Result<()>
     where
         S: ReadableWritableListableStorageTraits + ?Sized + 'static,
@@ -54,8 +58,75 @@ impl SparseScatterer {
             usize::MAX
         };
 
+        // Attempt NNZ-chunk passthrough for identity-mapped prefix
+        let mut passthrough_data_chunks = 0usize;
+        let mut passthrough_indices_chunks = 0usize;
+        let mut passthrough_rows: HashSet<(u16, usize)> = HashSet::new();
+
+        if passthrough_possible {
+            let identity_set = build_sparse_identity_set(assignments);
+
+            for (store_id, store) in stores.iter().enumerate() {
+                let sid = store_id as u16;
+                let out_indptr = &store.out_indptr;
+
+                // Find the longest identity prefix: consecutive rows where
+                // source_row == output_row starting from row 0
+                let mut prefix_end = 0usize;
+                let n_out_rows = out_indptr.len().saturating_sub(1);
+                for r in 0..n_out_rows {
+                    if identity_set.contains(&(sid, r)) {
+                        prefix_end = r + 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if prefix_end == 0 {
+                    continue;
+                }
+
+                // NNZ range covered by the identity prefix
+                let identity_nnz_end = src_indptr[prefix_end] as usize;
+
+                // Copy data chunks that are fully within the identity NNZ range
+                let dc = passthrough_1d_chunks(
+                    src_data, store.dst_data, identity_nnz_end,
+                )?;
+                passthrough_data_chunks += dc;
+
+                let ic = passthrough_1d_chunks(
+                    src_indices, store.dst_indices, identity_nnz_end,
+                )?;
+                passthrough_indices_chunks += ic;
+
+                for r in 0..prefix_end {
+                    passthrough_rows.insert((sid, r));
+                }
+            }
+        }
+
+        log::info!(
+            "SparseScatterer: {} stores, {} assignments, passthrough: {} data chunks, {} indices chunks",
+            stores.len(), assignments.len(), passthrough_data_chunks, passthrough_indices_chunks
+        );
+
+        // Filter assignments to exclude rows handled by passthrough
+        let effective_assignments: Vec<&RowAssignment> = if passthrough_rows.is_empty() {
+            assignments.iter().collect()
+        } else {
+            assignments.iter()
+                .filter(|a| !passthrough_rows.contains(&(a.store_id, a.output_row)))
+                .collect()
+        };
+
+        if effective_assignments.is_empty() {
+            log::info!("SparseScatterer: all rows handled via passthrough");
+            return Ok(());
+        }
+
         // Sort assignments by source indptr position for sequential reads
-        let mut sorted_assigns: Vec<&RowAssignment> = assignments.iter().collect();
+        let mut sorted_assigns: Vec<&RowAssignment> = effective_assignments;
         sorted_assigns.sort_unstable_by_key(|a| src_indptr[a.source_row] as usize);
 
         // Group into batches by cumulative NNZ
@@ -75,8 +146,8 @@ impl SparseScatterer {
         batch_ranges.push((batch_start, sorted_assigns.len()));
 
         log::info!(
-            "SparseScatterer: {} stores, {} assignments, {} batches, max_nnz={}",
-            stores.len(), assignments.len(), batch_ranges.len(), max_nnz_per_batch
+            "SparseScatterer: {} remaining assignments, {} batches, max_nnz={}",
+            sorted_assigns.len(), batch_ranges.len(), max_nnz_per_batch
         );
 
         for (batch_idx, &(start, end)) in batch_ranges.iter().enumerate() {
@@ -199,6 +270,70 @@ impl SparseScatterer {
 
         Ok(())
     }
+}
+
+/// Copy 1D encoded chunks from src to dst that are fully within
+/// [0, identity_nnz_end). Returns the number of chunks copied.
+fn passthrough_1d_chunks<S>(
+    src: &Array<S>,
+    dst: &Array<S>,
+    identity_nnz_end: usize,
+) -> Result<usize>
+where
+    S: ReadableWritableListableStorageTraits + ?Sized + 'static,
+{
+    let src_grid = src.chunk_grid_shape();
+    let dst_grid = dst.chunk_grid_shape();
+
+    if src_grid.is_empty() || dst_grid.is_empty() {
+        return Ok(0);
+    }
+
+    // Verify matching chunk sizes
+    let src_cs = src.chunk_shape(&vec![0u64])?.iter().map(|s| s.get()).next().unwrap_or(0);
+    let dst_cs = dst.chunk_shape(&vec![0u64])?.iter().map(|s| s.get()).next().unwrap_or(0);
+
+    if src_cs != dst_cs || src_cs == 0 {
+        return Ok(0);
+    }
+
+    let chunk_size = src_cs as usize;
+    let mut copied = 0usize;
+
+    let n_src_chunks = src_grid[0];
+    for chunk_idx in 0..n_src_chunks {
+        let chunk_start = chunk_idx as usize * chunk_size;
+        let chunk_end = chunk_start + chunk_size;
+
+        // Only copy chunks fully within the identity range
+        if chunk_end > identity_nnz_end {
+            break;
+        }
+
+        let indices = vec![chunk_idx];
+        if let Some(encoded) = src.retrieve_encoded_chunk(&indices)? {
+            unsafe {
+                dst.store_encoded_chunk(
+                    &indices,
+                    bytes::Bytes::from(encoded),
+                )?;
+            }
+            copied += 1;
+        }
+    }
+
+    Ok(copied)
+}
+
+/// Build a set of (store_id, row) pairs where source_row == output_row.
+fn build_sparse_identity_set(assignments: &[RowAssignment]) -> HashSet<(u16, usize)> {
+    let mut set = HashSet::with_capacity(assignments.len());
+    for a in assignments {
+        if a.source_row == a.output_row {
+            set.insert((a.store_id, a.output_row));
+        }
+    }
+    set
 }
 
 struct MergedSparseRun<'a> {

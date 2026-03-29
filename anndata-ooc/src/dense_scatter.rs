@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Result, bail};
 use rayon::prelude::*;
 use zarrs::array::{Array, ArrayBytes, ArraySubset};
@@ -26,12 +28,14 @@ impl DenseScatterer {
     /// `dsts[i]` is the zarrs Array for store i.
     /// `assignments` maps each source row to a (store_id, output_row).
     /// `store_n_rows[i]` is the total row count for destination i.
+    /// `passthrough_possible` indicates src and dst share chunk/codec config.
     pub fn scatter<S>(
         &self,
         src: &Array<S>,
         dsts: &[&Array<S>],
         assignments: &[RowAssignment],
         store_n_rows: &[usize],
+        passthrough_possible: bool,
     ) -> Result<()>
     where
         S: ReadableWritableListableStorageTraits + ?Sized + 'static,
@@ -59,15 +63,97 @@ impl DenseScatterer {
             store_chunk_sizes.push(cs);
         }
 
+        // Attempt chunk passthrough for identity-mapped chunks
+        let mut passthrough_count = 0usize;
+        let mut remaining_assignments: Vec<RowAssignment> = Vec::new();
+
+        if passthrough_possible {
+            let src_chunk_size = {
+                let grid = src.chunk_grid_shape();
+                if grid.is_empty() {
+                    src_shape[0] as usize
+                } else {
+                    let cs = src.chunk_shape(&vec![0u64; src_shape.len()])?;
+                    cs[0].get() as usize
+                }
+            };
+
+            let can_pt = store_chunk_sizes.iter().all(|&cs| cs == src_chunk_size);
+
+            if can_pt {
+                let identity_set = build_identity_set(assignments);
+                let n_src_chunks = src.chunk_grid_shape();
+                let n_row_chunks = if n_src_chunks.is_empty() { 0 } else { n_src_chunks[0] };
+
+                let mut passthrough_chunks: HashSet<(u16, u64)> = HashSet::new();
+
+                for store_id in 0..dsts.len() as u16 {
+                    let n_out = store_n_rows[store_id as usize];
+                    let n_dst_chunks = (n_out + src_chunk_size - 1) / src_chunk_size;
+
+                    for chunk_idx in 0..n_dst_chunks as u64 {
+                        let row_start = chunk_idx as usize * src_chunk_size;
+                        let row_end = (row_start + src_chunk_size).min(n_out);
+
+                        let all_identity = (row_start..row_end).all(|r| {
+                            identity_set.contains(&(store_id, r))
+                        });
+
+                        if all_identity && chunk_idx < n_row_chunks {
+                            passthrough_chunks.insert((store_id, chunk_idx));
+                        }
+                    }
+                }
+
+                // Execute passthrough copies
+                for &(store_id, chunk_idx) in &passthrough_chunks {
+                    let chunk_indices = vec![chunk_idx, 0];
+                    if let Some(encoded) = src.retrieve_encoded_chunk(&chunk_indices)? {
+                        unsafe {
+                            dsts[store_id as usize].store_encoded_chunk(
+                                &chunk_indices,
+                                bytes::Bytes::from(encoded),
+                            )?;
+                        }
+                        passthrough_count += 1;
+                    }
+                }
+
+                // Filter out assignments that were handled by passthrough
+                for a in assignments {
+                    let chunk_idx = (a.output_row / src_chunk_size) as u64;
+                    if !passthrough_chunks.contains(&(a.store_id, chunk_idx)) {
+                        remaining_assignments.push(*a);
+                    }
+                }
+            } else {
+                remaining_assignments.extend_from_slice(assignments);
+            }
+        } else {
+            remaining_assignments.extend_from_slice(assignments);
+        }
+
+        log::info!(
+            "DenseScatterer: {} stores, {} total assignments, passthrough={} chunks",
+            dsts.len(), assignments.len(), passthrough_count
+        );
+
+        if remaining_assignments.is_empty() {
+            log::info!("DenseScatterer: all chunks handled via passthrough");
+            return Ok(());
+        }
+
         let headroom = 4 * 1024 * 1024;
         let min_chunk = store_chunk_sizes.iter().copied().min().unwrap_or(1);
         let max_rows = self.pool.max_rows_for_dense(n_cols, elem_size, headroom).max(min_chunk);
 
-        let passes = ScatterPlanner::plan(assignments, &store_chunk_sizes, store_n_rows, max_rows);
+        let passes = ScatterPlanner::plan(
+            &remaining_assignments, &store_chunk_sizes, store_n_rows, max_rows,
+        );
 
         log::info!(
-            "DenseScatterer: {} stores, {} total assignments, {} cols, elem_size={}, {} passes",
-            dsts.len(), assignments.len(), n_cols, elem_size, passes.len()
+            "DenseScatterer: {} remaining assignments, {} cols, elem_size={}, {} passes",
+            remaining_assignments.len(), n_cols, elem_size, passes.len()
         );
 
         for (pass_idx, pass) in passes.iter().enumerate() {
@@ -154,6 +240,18 @@ impl DenseScatterer {
 
         Ok(())
     }
+}
+
+/// Build a set of (store_id, row) pairs where source_row == output_row,
+/// i.e. identity-mapped rows.
+fn build_identity_set(assignments: &[RowAssignment]) -> HashSet<(u16, usize)> {
+    let mut set = HashSet::with_capacity(assignments.len());
+    for a in assignments {
+        if a.source_row == a.output_row {
+            set.insert((a.store_id, a.output_row));
+        }
+    }
+    set
 }
 
 struct MergedSourceRun {

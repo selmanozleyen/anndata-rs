@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Result, Context};
 use ndarray::{Array1, ArrayD, Ix1};
@@ -6,6 +7,8 @@ use ndarray::{Array1, ArrayD, Ix1};
 use anndata::backend::{Backend, DataType, GroupOp, ScalarType, DatasetOp, AttributeOp};
 use anndata::data::slice::SelectInfoElem;
 use anndata_zarr::Zarr;
+use zarrs::array::ArrayBuilder;
+use zarrs::storage::ReadableWritableListableStorageTraits;
 
 use crate::budget::{BufferPool, MemoryBudget};
 use crate::dense_scatter::DenseScatterer;
@@ -63,9 +66,13 @@ pub fn scatter_anndata(
         compression_level: resolved_level,
     };
 
+    let passthrough_possible = config.chunk_size.is_none()
+        && config.shard_size.is_none()
+        && config.target_shard_bytes.is_none();
+
     log::info!(
-        "Scatter: compression_level={} (requested={:?})",
-        resolved_level, config.compression_level
+        "Scatter: compression_level={} (requested={:?}), passthrough_possible={}",
+        resolved_level, config.compression_level, passthrough_possible
     );
 
     let src_store: <Zarr as Backend>::Store = Zarr::open(src_path)
@@ -92,7 +99,8 @@ pub fn scatter_anndata(
 
     if src_items.contains(&"X".to_string()) {
         scatter_matrix_element(
-            &src_store, &dst_stores, "X", assignments, &store_n_rows, &pool, &resolved_config,
+            &src_store, &dst_stores, "X", assignments, &store_n_rows, &pool,
+            &resolved_config, passthrough_possible,
         )?;
     }
 
@@ -106,7 +114,8 @@ pub fn scatter_anndata(
             let children = src_group.list()?;
             for child in &children {
                 scatter_matrix_element_in_group(
-                    &src_group, &dst_groups, child, assignments, &store_n_rows, &pool, &resolved_config,
+                    &src_group, &dst_groups, child, assignments, &store_n_rows, &pool,
+                    &resolved_config, passthrough_possible,
                 )?;
             }
         }
@@ -182,8 +191,11 @@ fn scatter_matrix_element<G: GroupOp<Zarr>>(
     store_n_rows: &[usize],
     pool: &BufferPool,
     config: &ResolvedScatterConfig,
+    passthrough_possible: bool,
 ) -> Result<()> {
-    scatter_matrix_element_in_group(src_store, dst_stores, name, assignments, store_n_rows, pool, config)
+    scatter_matrix_element_in_group(
+        src_store, dst_stores, name, assignments, store_n_rows, pool, config, passthrough_possible,
+    )
 }
 
 fn scatter_matrix_element_in_group<G: GroupOp<Zarr>>(
@@ -194,6 +206,7 @@ fn scatter_matrix_element_in_group<G: GroupOp<Zarr>>(
     store_n_rows: &[usize],
     pool: &BufferPool,
     config: &ResolvedScatterConfig,
+    passthrough_possible: bool,
 ) -> Result<()> {
     use anndata::backend::DataContainer;
 
@@ -207,7 +220,7 @@ fn scatter_matrix_element_in_group<G: GroupOp<Zarr>>(
             if shape.ndim() >= 2 {
                 scatter_dense_dataset(
                     src_group, dst_groups, name, assignments, store_n_rows,
-                    scalar_type, pool, config,
+                    scalar_type, pool, config, passthrough_possible,
                 )?;
             } else {
                 log::warn!("Skipping 1-D dataset '{}' (obs handled in Python)", name);
@@ -216,7 +229,7 @@ fn scatter_matrix_element_in_group<G: GroupOp<Zarr>>(
         DataType::CsrMatrix(scalar_type) => {
             scatter_csr_group(
                 src_group, dst_groups, name, assignments, store_n_rows,
-                scalar_type, pool, config,
+                scalar_type, pool, config, passthrough_possible,
             )?;
         }
         DataType::CscMatrix(_) => {
@@ -243,29 +256,42 @@ fn scatter_dense_dataset<G: GroupOp<Zarr>>(
     scalar_type: ScalarType,
     pool: &BufferPool,
     config: &ResolvedScatterConfig,
+    passthrough_possible: bool,
 ) -> Result<()> {
     let src_ds = src_group.open_dataset(name)?;
     let src_shape = src_ds.shape();
+
+    let use_cloned_metadata = passthrough_possible
+        && config.base.compression_level.is_none();
 
     let mut dst_datasets: Vec<<Zarr as Backend>::Dataset> = Vec::with_capacity(dst_groups.len());
     for (i, dst_group) in dst_groups.iter().enumerate() {
         let mut out_shape = src_shape.as_ref().to_vec();
         out_shape[0] = store_n_rows[i];
 
-        let mut ds = dst_group.new_empty_dataset_typed_configured(
-            name, scalar_type, &out_shape.into(),
-            config.base.chunk_size, config.base.shard_size, config.base.target_shard_bytes,
-            Some(config.compression_level),
-        )?;
-        copy_encoding_attrs(&src_ds, &mut ds)?;
-        dst_datasets.push(ds);
+        if use_cloned_metadata {
+            let ds = clone_dataset_with_shape(
+                src_ds.inner(), dst_group, name, &out_shape,
+            )?;
+            dst_datasets.push(ds);
+        } else {
+            let mut ds = dst_group.new_empty_dataset_typed_configured(
+                name, scalar_type, &out_shape.into(),
+                config.base.chunk_size, config.base.shard_size, config.base.target_shard_bytes,
+                Some(config.compression_level),
+            )?;
+            copy_encoding_attrs(&src_ds, &mut ds)?;
+            dst_datasets.push(ds);
+        }
     }
 
     let dst_inners: Vec<_> = dst_datasets.iter().map(|d| d.inner()).collect();
     let dst_refs: Vec<&zarrs::array::Array<_>> = dst_inners.iter().map(|a| *a).collect();
 
+    let can_passthrough = passthrough_possible && use_cloned_metadata;
+
     let scatterer = DenseScatterer::new(pool.clone_with_same_budget());
-    scatterer.scatter(src_ds.inner(), &dst_refs, assignments, store_n_rows)
+    scatterer.scatter(src_ds.inner(), &dst_refs, assignments, store_n_rows, can_passthrough)
 }
 
 fn scatter_csr_group<G: GroupOp<Zarr>>(
@@ -276,7 +302,8 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
     store_n_rows: &[usize],
     scalar_type: ScalarType,
     pool: &BufferPool,
-    _config: &ResolvedScatterConfig,
+    config: &ResolvedScatterConfig,
+    passthrough_possible: bool,
 ) -> Result<()> {
     let src_g = src_group.open_group(name)?;
     let shape_attr: Vec<u64> = src_g.get_attr("shape")?;
@@ -309,6 +336,9 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
     let src_indices_ds = src_g.open_dataset("indices")?;
     let indices_dtype = src_indices_ds.dtype()?;
 
+    let use_cloned_metadata = passthrough_possible
+        && config.base.compression_level.is_none();
+
     let mut store_arrays: Vec<SparseStoreArrays<'_, _>> = Vec::new();
 
     struct CsrStoreState {
@@ -336,12 +366,23 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
             anndata::backend::get_default_write_config(),
         )?;
 
-        let dst_data_ds = dst_g.new_empty_dataset_typed(
-            "data", scalar_type, &vec![total_nnz].into(),
-        )?;
-        let dst_indices_ds = dst_g.new_empty_dataset_typed(
-            "indices", indices_dtype, &vec![total_nnz].into(),
-        )?;
+        let (dst_data_ds, dst_indices_ds) = if use_cloned_metadata && total_nnz > 0 {
+            let dd = clone_dataset_with_shape(
+                src_data_ds.inner(), &dst_g, "data", &[total_nnz],
+            )?;
+            let di = clone_dataset_with_shape(
+                src_indices_ds.inner(), &dst_g, "indices", &[total_nnz],
+            )?;
+            (dd, di)
+        } else {
+            let dd = dst_g.new_empty_dataset_typed(
+                "data", scalar_type, &vec![total_nnz].into(),
+            )?;
+            let di = dst_g.new_empty_dataset_typed(
+                "indices", indices_dtype, &vec![total_nnz].into(),
+            )?;
+            (dd, di)
+        };
 
         store_states.push(CsrStoreState {
             _group: dst_g,
@@ -358,6 +399,8 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
         });
     }
 
+    let can_passthrough = passthrough_possible && use_cloned_metadata;
+
     let scatterer = SparseScatterer::new(pool.clone_with_same_budget());
     scatterer.scatter_data_indices(
         src_indices_ds.inner(),
@@ -365,6 +408,7 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
         &store_arrays,
         assignments,
         &src_indptr,
+        can_passthrough,
     )?;
 
     Ok(())
@@ -414,6 +458,60 @@ fn copy_encoding_attrs(
         dst.new_json_attr("encoding-version", &ver)?;
     }
     Ok(())
+}
+
+/// Clone a source zarrs Array with a new shape, preserving all codec/chunk
+/// configuration. Returns a ZarrDataset backed by the destination group's store.
+fn clone_dataset_with_shape<G: GroupOp<Zarr>>(
+    src_arr: &zarrs::array::Array<dyn ReadableWritableListableStorageTraits>,
+    dst_group: &G,
+    name: &str,
+    out_shape: &[usize],
+) -> Result<<Zarr as Backend>::Dataset> {
+    let shape_u64: Vec<u64> = out_shape.iter().map(|&s| s as u64).collect();
+    let mut builder = ArrayBuilder::from_array(src_arr);
+    builder.shape(shape_u64);
+
+    let dst_ds = dst_group.open_dataset("__probe_for_store_path__");
+    drop(dst_ds);
+
+    let src_ds_for_store = src_arr;
+    let _ = src_ds_for_store;
+
+    let tmp_ds = dst_group.new_empty_dataset::<u8>(
+        "__tmp_probe__",
+        &vec![1usize].into(),
+        anndata::backend::get_default_write_config(),
+    )?;
+    let probe_store: anndata_zarr::ZarrStore = tmp_ds.store()?;
+    let probe_path = tmp_ds.path();
+    let parent_path = probe_path.parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    dst_group.delete("__tmp_probe__")?;
+
+    let dst_path = if parent_path == "/" || parent_path.is_empty() {
+        format!("/{}", name)
+    } else {
+        format!("{}/{}", parent_path, name)
+    };
+
+    let store_arc: Arc<dyn ReadableWritableListableStorageTraits> = (*probe_store).clone();
+    let dst_arr = builder.build(store_arc.clone(), &dst_path)?;
+    dst_arr.store_metadata()?;
+
+    let src_ds_tmp = dst_group.open_dataset(name)?;
+
+    if let Some(enc) = src_arr.attributes().get("encoding-type") {
+        let mut ds = src_ds_tmp;
+        ds.new_json_attr("encoding-type", enc)?;
+        if let Some(ver) = src_arr.attributes().get("encoding-version") {
+            ds.new_json_attr("encoding-version", ver)?;
+        }
+        return Ok(ds);
+    }
+
+    Ok(src_ds_tmp)
 }
 
 fn copy_group<G: GroupOp<Zarr>>(

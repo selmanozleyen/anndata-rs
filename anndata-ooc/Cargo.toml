@@ -18,6 +18,7 @@ zarrs = { version = "0.23", features = ["ndarray", "sharding", "zstd"] }
 rayon = "1.11"
 log = "0.4"
 serde_json = "1"
+bytes = "1"
 
 [dev-dependencies]
 tempfile = "3.2"
