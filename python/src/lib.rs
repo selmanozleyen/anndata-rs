@@ -24,6 +24,7 @@ pub fn scatter(
         shard_size,
         target_shard_bytes,
         compression_level,
+        progress: None,
     };
 
     let mut assignments: Vec<anndata_ooc::RowAssignment> = Vec::new();
