@@ -168,7 +168,12 @@ impl SparseScatterer {
         Ok(())
     }
 
-    /// Phase 1: decode source data/indices in parallel across merged runs.
+    /// Phase 1: decode source data/indices in parallel.
+    ///
+    /// Merged runs that span multiple source zarr chunks are split into
+    /// per-chunk sub-runs so that each sub-run decodes independently,
+    /// giving true parallelism even when the merge heuristic collapses
+    /// everything into a single giant run (common for random shuffle).
     fn read_batch<S>(
         src_data: &Array<S>,
         src_indices: &Array<S>,
@@ -181,16 +186,35 @@ impl SparseScatterer {
     where
         S: ReadableWritableListableStorageTraits + ?Sized + 'static,
     {
+        let src_chunk_size = src_data
+            .chunk_grid_shape()
+            .first()
+            .and_then(|&n| {
+                if n == 0 {
+                    None
+                } else {
+                    src_data
+                        .chunk_shape(&[0u64])
+                        .ok()
+                        .and_then(|s| s.first().map(|c| c.get() as usize))
+                }
+            })
+            .unwrap_or(usize::MAX);
+
+        let sub_runs = split_merged_runs_by_chunk(merged, src_indptr, src_chunk_size);
+
         let map = Mutex::new(
-            std::collections::HashMap::<usize, (Vec<u8>, Vec<u8>)>::with_capacity(capacity),
+            std::collections::HashMap::<usize, (Vec<u8>, Vec<u8>)>::with_capacity(
+                capacity,
+            ),
         );
-        merged.par_iter().try_for_each(|run| -> Result<()> {
-            if run.nnz_end <= run.nnz_start {
+        sub_runs.par_iter().try_for_each(|sub| -> Result<()> {
+            if sub.nnz_end <= sub.nnz_start {
                 return Ok(());
             }
 
             let subset = ArraySubset::new_with_ranges(
-                &[run.nnz_start as u64..run.nnz_end as u64],
+                &[sub.nnz_start as u64..sub.nnz_end as u64],
             );
 
             let data_bytes: ArrayBytes<'static> =
@@ -201,16 +225,16 @@ impl SparseScatterer {
             let indices_raw = indices_bytes.into_fixed()?.into_owned();
 
             let mut local: Vec<(usize, Vec<u8>, Vec<u8>)> =
-                Vec::with_capacity(run.assignments.len());
+                Vec::with_capacity(sub.assignments.len());
 
-            for a in &run.assignments {
+            for a in &sub.assignments {
                 let lo = src_indptr[a.source_row] as usize;
                 let hi = src_indptr[a.source_row + 1] as usize;
                 if hi <= lo {
                     continue;
                 }
-                let rel_lo = lo - run.nnz_start;
-                let rel_hi = hi - run.nnz_start;
+                let rel_lo = lo - sub.nnz_start;
+                let rel_hi = hi - sub.nnz_start;
 
                 let d =
                     data_raw[rel_lo * data_elem_size..rel_hi * data_elem_size].to_vec();
@@ -357,6 +381,77 @@ fn merge_sparse_reads<'a>(
     });
 
     runs
+}
+
+/// Split merged runs into sub-runs aligned to source zarr chunk boundaries.
+///
+/// A single merged run that spans N source chunks becomes N sub-runs, each
+/// covering exactly one chunk's NNZ range. This creates N independent decode
+/// tasks for rayon even when the merge heuristic collapses all reads into
+/// one giant run (the common case for random shuffle).
+fn split_merged_runs_by_chunk<'a>(
+    merged: &[MergedSparseRun<'a>],
+    src_indptr: &[i64],
+    src_chunk_size: usize,
+) -> Vec<MergedSparseRun<'a>> {
+    let mut out = Vec::new();
+    for run in merged {
+        if run.nnz_end <= run.nnz_start || src_chunk_size == usize::MAX {
+            out.push(MergedSparseRun {
+                nnz_start: run.nnz_start,
+                nnz_end: run.nnz_end,
+                assignments: run.assignments.clone(),
+            });
+            continue;
+        }
+
+        let first_chunk = run.nnz_start / src_chunk_size;
+        let last_chunk = (run.nnz_end - 1) / src_chunk_size;
+
+        if first_chunk == last_chunk {
+            out.push(MergedSparseRun {
+                nnz_start: run.nnz_start,
+                nnz_end: run.nnz_end,
+                assignments: run.assignments.clone(),
+            });
+            continue;
+        }
+
+        // Partition assignments into per-chunk buckets by their NNZ range
+        let n_chunks = last_chunk - first_chunk + 1;
+        let mut buckets: Vec<Vec<&'a RowAssignment>> =
+            (0..n_chunks).map(|_| Vec::new()).collect();
+
+        for &a in &run.assignments {
+            let lo = src_indptr[a.source_row] as usize;
+            let chunk_idx = lo / src_chunk_size;
+            let bucket = chunk_idx - first_chunk;
+            buckets[bucket.min(n_chunks - 1)].push(a);
+        }
+
+        for (i, assigns) in buckets.into_iter().enumerate() {
+            if assigns.is_empty() {
+                continue;
+            }
+            let chunk_idx = first_chunk + i;
+            let sub_nnz_start = if chunk_idx == first_chunk {
+                run.nnz_start
+            } else {
+                chunk_idx * src_chunk_size
+            };
+            let sub_nnz_end = if chunk_idx == last_chunk {
+                run.nnz_end
+            } else {
+                (chunk_idx + 1) * src_chunk_size
+            };
+            out.push(MergedSparseRun {
+                nnz_start: sub_nnz_start,
+                nnz_end: sub_nnz_end,
+                assignments: assigns,
+            });
+        }
+    }
+    out
 }
 
 struct OutputRun {

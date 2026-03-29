@@ -599,10 +599,13 @@ class TestSplit:
 class TestPassthrough:
     """Verify chunk passthrough fires for truncation (identity prefix)."""
 
-    def _read_shard_bytes(self, zarr_path, array_name="X"):
-        """Read raw shard/chunk files and return dict {filename: bytes}."""
+    def _read_shard_bytes(self, zarr_path, array_rel="X"):
+        """Read raw chunk files and return dict {filename: bytes}.
+
+        array_rel can be 'X' (2D dense), 'X/data' (1D sparse), etc.
+        """
         import glob
-        arr_dir = os.path.join(zarr_path, array_name, "c")
+        arr_dir = os.path.join(zarr_path, array_rel, "c")
         result = {}
         for f in glob.glob(os.path.join(arr_dir, "**", "*"), recursive=True):
             if os.path.isfile(f):
@@ -640,8 +643,8 @@ class TestPassthrough:
             f"Passthrough did not fire for truncation."
         )
 
-    def test_truncation_sparse_correct(self, zarr_pair):
-        """Truncating a sparse CSR array produces correct data."""
+    def test_truncation_sparse_bitwise_identical(self, zarr_pair):
+        """Truncating a sparse CSR should copy chunk files verbatim."""
         src, dst = zarr_pair
         np.random.seed(201)
         n_obs, n_vars = 2000, 50
@@ -657,6 +660,18 @@ class TestPassthrough:
         result = ad.read_zarr(dst)
         actual = result.X.toarray() if issparse(result.X) else result.X
         np.testing.assert_allclose(actual, dense[:n_keep], atol=1e-6)
+
+        for arr_name in ("X/data", "X/indices"):
+            src_chunks = self._read_shard_bytes(src, arr_name)
+            dst_chunks = self._read_shard_bytes(dst, arr_name)
+            shared = set(src_chunks.keys()) & set(dst_chunks.keys())
+            identical = sum(
+                1 for k in shared if src_chunks[k] == dst_chunks[k]
+            )
+            assert identical > 0, (
+                f"No bit-identical chunk files for {arr_name} among "
+                f"{len(shared)} shared keys. Sparse passthrough did not fire."
+            )
 
     def test_shuffle_no_passthrough(self, zarr_pair):
         """A random shuffle should NOT produce bit-identical chunks."""
