@@ -48,23 +48,11 @@ def scatter(
     """
     input = str(input)
 
-    src_adata = ad.read_zarr(input)
-    src_obs = src_adata.obs
-
     rust_outputs = []
     for dst_path, indices in outputs:
         dst_path = str(dst_path)
         idx = np.asarray(indices, dtype=np.int64)
-
-        dst_obs = src_obs.iloc[idx].copy()
-        dst_obs.reset_index(drop=True, inplace=True)
-
-        store = zarr.open(dst_path, mode="w")
-        ad.io.write_elem(store, "obs", dst_obs)
-
         rust_outputs.append((dst_path, idx))
-
-    del src_obs, src_adata
 
     kwargs = {}
     if memory_limit is not None:
@@ -77,6 +65,13 @@ def scatter(
         kwargs["target_shard_bytes"] = target_shard_bytes
 
     _scatter(input, rust_outputs, **kwargs)
+
+    src_obs = ad.read_zarr(input).obs
+    for dst_path, idx in rust_outputs:
+        dst_obs = src_obs.iloc[idx].copy()
+        dst_obs.reset_index(drop=True, inplace=True)
+        store = zarr.open(dst_path, mode="r+")
+        ad.io.write_elem(store, "obs", dst_obs)
 
 
 def permute(
