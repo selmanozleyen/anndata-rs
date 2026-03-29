@@ -10,17 +10,20 @@ homepage = "https://github.com/"
 keywords = ["data"]
 
 [dependencies]
-pyanndata = { workspace = true }
+pyanndata = { workspace = true, optional = true }
+anndata-ooc = { workspace = true }
 pyo3-log = "0.13"
+numpy = "0.27"
+anyhow = "1.0"
 
 [dependencies.pyo3]
 version = "0.27"
-features = ["multiple-pymethods"]
+features = ["multiple-pymethods", "anyhow"]
 
 [features]
-default = ["polars"]
-polars = ["pyanndata/polars"]
-extension-module = ["pyo3/extension-module", "pyanndata/extension-module"]
+default = ["full"]
+full = ["pyanndata"]
+extension-module = ["pyo3/extension-module", "pyanndata?/extension-module"]
 
 [lib]
 name = "anndata_rs"

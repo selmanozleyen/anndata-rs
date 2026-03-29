@@ -8,6 +8,11 @@ module-name = "anndata_rs.anndata_rs"
 python-source = "."
 build-dir = "build"
 
+# To build without polars (scatter-only, fast compile):
+#   maturin develop --no-default-features --features extension-module
+# To build with everything (default):
+#   maturin develop
+
 [project]
 name = "anndata_rs"
 authors = [
