@@ -6,22 +6,22 @@ use zarrs::array::{Array, ArrayBytes, ArraySubset};
 use zarrs::storage::ReadableWritableListableStorageTraits;
 
 use crate::budget::BufferPool;
-use crate::scatter::RowAssignment;
-
-/// Out-of-core CSR sparse data/indices scatterer supporting multiple outputs.
-///
-/// Generalizes SparsePermuter: reads source data/indices once per batch and
-/// writes to N destination data/indices arrays. Batching is by cumulative NNZ
-/// that fits in memory.
-pub struct SparseScatterer {
-    pool: BufferPool,
-}
+use crate::scatter::{RowAssignment, ScatterPlanner, SparseScatterPass};
 
 /// Per-store CSR arrays and indptr for the scatter engine.
 pub struct SparseStoreArrays<'a, S: ?Sized> {
     pub dst_indices: &'a Array<S>,
     pub dst_data: &'a Array<S>,
     pub out_indptr: Vec<i64>,
+}
+
+/// Out-of-core CSR sparse data/indices scatterer supporting multiple outputs.
+///
+/// Uses chunk-aligned writes: plans by destination NNZ chunks, accumulates
+/// full chunk buffers, and writes each chunk exactly once via `store_chunk`
+/// (no read-modify-write overhead).
+pub struct SparseScatterer {
+    pool: BufferPool,
 }
 
 impl SparseScatterer {
@@ -50,117 +50,50 @@ impl SparseScatterer {
         let data_elem_size = src_data.data_type().fixed_size().unwrap_or(8);
         let indices_elem_size = src_indices.data_type().fixed_size().unwrap_or(8);
         let bytes_per_nnz = data_elem_size + indices_elem_size;
+
+        let _ = passthrough_possible;
+
         let headroom = 8 * 1024 * 1024;
         let available = self.pool.budget().available().saturating_sub(headroom);
-        let max_nnz_per_batch = if bytes_per_nnz > 0 {
-            (available / bytes_per_nnz).max(4096)
+        // Each NNZ needs bytes_per_nnz for both read buffer and write buffer,
+        // so budget is halved between source reads and destination chunk buffers
+        let max_nnz_per_pass = if bytes_per_nnz > 0 {
+            (available / bytes_per_nnz / 2).max(4096)
         } else {
             usize::MAX
         };
 
-        // Sparse 1D passthrough is handled at the engine level via
-        // filesystem-level chunk file copies (see scatter_engine.rs).
-        // Here we just process whatever assignments are given to us.
-        let _ = passthrough_possible;
-        let effective_assignments: Vec<&RowAssignment> = assignments.iter().collect();
+        let store_indptrs: Vec<&[i64]> = stores.iter()
+            .map(|s| s.out_indptr.as_slice())
+            .collect();
 
-        // Sort assignments by source indptr position for sequential reads
-        let mut sorted_assigns: Vec<&RowAssignment> = effective_assignments;
-        sorted_assigns.sort_unstable_by_key(|a| src_indptr[a.source_row] as usize);
+        let store_nnz_chunk_sizes: Vec<usize> = stores.iter()
+            .map(|s| {
+                get_chunk_size_1d(s.dst_data)
+            })
+            .collect();
 
-        // Group into batches by cumulative NNZ
-        let mut batch_ranges: Vec<(usize, usize)> = Vec::new();
-        let mut batch_start = 0usize;
-        let mut batch_nnz = 0usize;
-
-        for (idx, a) in sorted_assigns.iter().enumerate() {
-            let row_nnz = (src_indptr[a.source_row + 1] - src_indptr[a.source_row]) as usize;
-            if batch_nnz + row_nnz > max_nnz_per_batch && batch_nnz > 0 {
-                batch_ranges.push((batch_start, idx));
-                batch_start = idx;
-                batch_nnz = 0;
-            }
-            batch_nnz += row_nnz;
-        }
-        batch_ranges.push((batch_start, sorted_assigns.len()));
-
-        log::info!(
-            "SparseScatterer: {} remaining assignments, {} batches, max_nnz={}",
-            sorted_assigns.len(), batch_ranges.len(), max_nnz_per_batch
+        let passes = ScatterPlanner::plan_sparse(
+            assignments,
+            &store_indptrs,
+            &store_nnz_chunk_sizes,
+            max_nnz_per_pass,
         );
 
-        // Phase 3: pipeline reads and writes across batches.
-        // While batch N is writing, batch N+1 is reading. The row_map for
-        // the next batch is built concurrently with the current batch's
-        // writes using rayon::scope.
-        type RowMap = std::collections::HashMap<usize, (Vec<u8>, Vec<u8>)>;
+        log::info!(
+            "SparseScatterer: {} assignments, {} passes (chunk-aligned), max_nnz/pass={}",
+            assignments.len(), passes.len(), max_nnz_per_pass
+        );
 
-        let mut prev_row_map: Option<RowMap> = None;
-        let mut prev_batch_assigns: Option<&[&RowAssignment]> = None;
-
-        for (batch_idx, &(start, end)) in batch_ranges.iter().enumerate() {
+        for (pass_idx, pass) in passes.iter().enumerate() {
             log::debug!(
-                "Batch {}/{}: {} assignments",
-                batch_idx + 1, batch_ranges.len(), end - start
+                "Pass {}/{}: {} dst chunks, total_nnz={}",
+                pass_idx + 1, passes.len(), pass.chunks.len(), pass.total_nnz
             );
 
-            let cur_assigns = &sorted_assigns[start..end];
-            let cur_merged = merge_sparse_reads(cur_assigns, src_indptr, 8192);
-
-            if let (Some(prev_map), Some(prev_assigns)) =
-                (prev_row_map.take(), prev_batch_assigns.take())
-            {
-                // Pipeline: overlap previous batch's writes with current
-                // batch's reads.
-                let mut next_map: Option<RowMap> = None;
-                let mut write_err: Option<anyhow::Error> = None;
-                let mut read_err: Option<anyhow::Error> = None;
-
-                rayon::scope(|s| {
-                    s.spawn(|_| {
-                        match self.write_batch(
-                            stores, prev_assigns, &prev_map,
-                            data_elem_size, indices_elem_size,
-                        ) {
-                            Ok(()) => {}
-                            Err(e) => write_err = Some(e),
-                        }
-                    });
-                    s.spawn(|_| {
-                        match Self::read_batch(
-                            src_data, src_indices, &cur_merged,
-                            src_indptr, data_elem_size, indices_elem_size,
-                            cur_assigns.len(),
-                        ) {
-                            Ok(m) => next_map = Some(m),
-                            Err(e) => read_err = Some(e),
-                        }
-                    });
-                });
-
-                if let Some(e) = write_err {
-                    return Err(e);
-                }
-                if let Some(e) = read_err {
-                    return Err(e);
-                }
-                prev_row_map = next_map;
-            } else {
-                prev_row_map = Some(Self::read_batch(
-                    src_data, src_indices, &cur_merged,
-                    src_indptr, data_elem_size, indices_elem_size,
-                    cur_assigns.len(),
-                )?);
-            }
-            prev_batch_assigns = Some(cur_assigns);
-        }
-
-        // Flush the final batch's writes
-        if let (Some(prev_map), Some(prev_assigns)) =
-            (prev_row_map.take(), prev_batch_assigns.take())
-        {
-            self.write_batch(
-                stores, prev_assigns, &prev_map,
+            self.process_pass(
+                src_data, src_indices, stores,
+                pass, src_indptr,
                 data_elem_size, indices_elem_size,
             )?;
         }
@@ -168,46 +101,78 @@ impl SparseScatterer {
         Ok(())
     }
 
-    /// Phase 1: decode source data/indices in parallel.
-    ///
-    /// Merged runs that span multiple source zarr chunks are split into
-    /// per-chunk sub-runs so that each sub-run decodes independently,
-    /// giving true parallelism even when the merge heuristic collapses
-    /// everything into a single giant run (common for random shuffle).
-    fn read_batch<S>(
+    /// Process one pass: read source data, assemble destination chunk buffers,
+    /// write whole chunks.
+    fn process_pass<S>(
+        &self,
         src_data: &Array<S>,
         src_indices: &Array<S>,
-        merged: &[MergedSparseRun<'_>],
+        stores: &[SparseStoreArrays<'_, S>],
+        pass: &SparseScatterPass,
         src_indptr: &[i64],
         data_elem_size: usize,
         indices_elem_size: usize,
-        capacity: usize,
+    ) -> Result<()>
+    where
+        S: ReadableWritableListableStorageTraits + ?Sized + 'static,
+    {
+        // Phase 1: collect all source rows needed for this pass and read them
+        let row_map = self.read_pass_sources(
+            src_data, src_indices, pass, src_indptr,
+            data_elem_size, indices_elem_size,
+        )?;
+
+        // Phase 2: assemble destination chunk buffers and write whole chunks
+        self.write_pass_chunks(
+            stores, pass, &row_map, src_indptr,
+            data_elem_size, indices_elem_size,
+        )?;
+
+        Ok(())
+    }
+
+    /// Read all source rows needed by this pass, returning a map of
+    /// source_row -> (data_bytes, indices_bytes).
+    fn read_pass_sources<S>(
+        &self,
+        src_data: &Array<S>,
+        src_indices: &Array<S>,
+        pass: &SparseScatterPass,
+        src_indptr: &[i64],
+        data_elem_size: usize,
+        indices_elem_size: usize,
     ) -> Result<std::collections::HashMap<usize, (Vec<u8>, Vec<u8>)>>
     where
         S: ReadableWritableListableStorageTraits + ?Sized + 'static,
     {
-        let src_chunk_size = src_data
-            .chunk_grid_shape()
-            .first()
-            .and_then(|&n| {
-                if n == 0 {
-                    None
-                } else {
-                    src_data
-                        .chunk_shape(&[0u64])
-                        .ok()
-                        .and_then(|s| s.first().map(|c| c.get() as usize))
-                }
-            })
-            .unwrap_or(usize::MAX);
+        // Collect unique source rows across all chunks in this pass
+        let mut source_rows: Vec<usize> = pass.chunks.iter()
+            .flat_map(|c| c.entries.iter().map(|e| e.source_row))
+            .collect();
+        source_rows.sort_unstable();
+        source_rows.dedup();
 
-        let sub_runs = split_merged_runs_by_chunk(merged, src_indptr, src_chunk_size);
+        let capacity = source_rows.len();
+
+        // Build RowAssignment-like structs for merge_sparse_reads
+        let fake_assigns: Vec<RowAssignment> = source_rows.iter()
+            .map(|&src_row| RowAssignment {
+                source_row: src_row,
+                store_id: 0,
+                output_row: 0,
+            })
+            .collect();
+        let assign_refs: Vec<&RowAssignment> = fake_assigns.iter().collect();
+
+        let merged = merge_sparse_reads(&assign_refs, src_indptr, 8192);
+
+        let src_chunk_size = get_chunk_size_1d(src_data);
+        let sub_runs = split_merged_runs_by_chunk(&merged, src_indptr, src_chunk_size);
 
         let map = Mutex::new(
-            std::collections::HashMap::<usize, (Vec<u8>, Vec<u8>)>::with_capacity(
-                capacity,
-            ),
+            std::collections::HashMap::<usize, (Vec<u8>, Vec<u8>)>::with_capacity(capacity),
         );
+
         sub_runs.par_iter().try_for_each(|sub| -> Result<()> {
             if sub.nnz_end <= sub.nnz_start {
                 return Ok(());
@@ -236,11 +201,8 @@ impl SparseScatterer {
                 let rel_lo = lo - sub.nnz_start;
                 let rel_hi = hi - sub.nnz_start;
 
-                let d =
-                    data_raw[rel_lo * data_elem_size..rel_hi * data_elem_size].to_vec();
-                let i = indices_raw
-                    [rel_lo * indices_elem_size..rel_hi * indices_elem_size]
-                    .to_vec();
+                let d = data_raw[rel_lo * data_elem_size..rel_hi * data_elem_size].to_vec();
+                let i = indices_raw[rel_lo * indices_elem_size..rel_hi * indices_elem_size].to_vec();
                 local.push((a.source_row, d, i));
             }
 
@@ -250,88 +212,124 @@ impl SparseScatterer {
             }
             Ok(())
         })?;
+
         Ok(map.into_inner().unwrap())
     }
 
-    /// Phase 2: encode and write to destinations in parallel across chunks.
-    fn write_batch<S>(
+    /// Assemble and write whole destination chunks in parallel.
+    fn write_pass_chunks<S>(
         &self,
         stores: &[SparseStoreArrays<'_, S>],
-        batch_assigns: &[&RowAssignment],
+        pass: &SparseScatterPass,
         row_map: &std::collections::HashMap<usize, (Vec<u8>, Vec<u8>)>,
+        src_indptr: &[i64],
         data_elem_size: usize,
         indices_elem_size: usize,
     ) -> Result<()>
     where
         S: ReadableWritableListableStorageTraits + ?Sized + 'static,
     {
-        let n_stores = stores.len();
-        let mut per_store: Vec<Vec<&RowAssignment>> = vec![Vec::new(); n_stores];
-        for a in batch_assigns {
-            per_store[a.store_id as usize].push(a);
-        }
+        pass.chunks.par_iter().try_for_each(|sc| -> Result<()> {
+            let store = &stores[sc.store_id as usize];
+            let out_indptr = &store.out_indptr;
+            let chunk_nnz = sc.nnz_end - sc.nnz_start;
 
-        per_store.par_iter().enumerate().try_for_each(
-            |(store_id, store_assigns)| -> Result<()> {
-                if store_assigns.is_empty() {
-                    return Ok(());
+            if chunk_nnz == 0 {
+                return Ok(());
+            }
+
+            let mut data_buf = vec![0u8; chunk_nnz * data_elem_size];
+            let mut indices_buf = vec![0u8; chunk_nnz * indices_elem_size];
+
+            // Sort entries by output_row so we fill the buffer in order
+            let mut sorted_entries = sc.entries.clone();
+            sorted_entries.sort_unstable_by_key(|e| e.output_row);
+
+            for entry in &sorted_entries {
+                let row_nnz_start = out_indptr[entry.output_row] as usize;
+                let row_nnz_end = out_indptr[entry.output_row + 1] as usize;
+                let row_nnz = row_nnz_end - row_nnz_start;
+                if row_nnz == 0 {
+                    continue;
                 }
 
-                let mut sorted: Vec<&&RowAssignment> = store_assigns.iter().collect();
-                sorted.sort_unstable_by_key(|a| a.output_row);
+                let offset_in_chunk = row_nnz_start - sc.nnz_start;
 
-                let runs =
-                    find_contiguous_output_runs(&sorted, &stores[store_id].out_indptr);
+                if let Some((d, i)) = row_map.get(&entry.source_row) {
+                    let src_nnz = (src_indptr[entry.source_row + 1]
+                        - src_indptr[entry.source_row]) as usize;
+                    let copy_nnz = src_nnz.min(row_nnz);
 
-                let dst_data = stores[store_id].dst_data;
-                let dst_indices = stores[store_id].dst_indices;
-                let out_indptr = &stores[store_id].out_indptr;
+                    let dst_data_start = offset_in_chunk * data_elem_size;
+                    let src_data_len = copy_nnz * data_elem_size;
+                    data_buf[dst_data_start..dst_data_start + src_data_len]
+                        .copy_from_slice(&d[..src_data_len]);
 
-                let chunk_groups =
-                    group_output_runs_by_dst_chunk(&runs, out_indptr, dst_data);
+                    let dst_idx_start = offset_in_chunk * indices_elem_size;
+                    let src_idx_len = copy_nnz * indices_elem_size;
+                    indices_buf[dst_idx_start..dst_idx_start + src_idx_len]
+                        .copy_from_slice(&i[..src_idx_len]);
+                }
+            }
 
-                chunk_groups.par_iter().try_for_each(|group| -> Result<()> {
-                    for run_idx in &group.run_indices {
-                        let run = &runs[*run_idx];
-                        let dst_nnz_start = out_indptr[run.out_start] as usize;
-                        let dst_nnz_end = out_indptr[run.out_end] as usize;
-                        let total_nnz = dst_nnz_end - dst_nnz_start;
-                        if total_nnz == 0 {
-                            continue;
-                        }
+            let total_dst_nnz = *out_indptr.last().unwrap_or(&0) as usize;
+            let dst_data_chunk_size = get_chunk_size_1d(store.dst_data);
+            let is_full_chunk = (sc.nnz_end - sc.nnz_start) == dst_data_chunk_size
+                || sc.nnz_end == total_dst_nnz;
 
-                        let mut assembled_data =
-                            Vec::with_capacity(total_nnz * data_elem_size);
-                        let mut assembled_indices =
-                            Vec::with_capacity(total_nnz * indices_elem_size);
+            if is_full_chunk {
+                // Write the entire chunk at once -- store_array_subset on a
+                // chunk-aligned range is equivalent to store_chunk but does not
+                // require us to figure out the chunk index encoding.
+                let write_subset = ArraySubset::new_with_ranges(
+                    &[sc.nnz_start as u64..sc.nnz_end as u64],
+                );
+                store.dst_data.store_array_subset(
+                    &write_subset,
+                    ArrayBytes::from(data_buf),
+                )?;
+                store.dst_indices.store_array_subset(
+                    &write_subset,
+                    ArrayBytes::from(indices_buf),
+                )?;
+            } else {
+                let write_subset = ArraySubset::new_with_ranges(
+                    &[sc.nnz_start as u64..sc.nnz_end as u64],
+                );
+                store.dst_data.store_array_subset(
+                    &write_subset,
+                    ArrayBytes::from(data_buf),
+                )?;
+                store.dst_indices.store_array_subset(
+                    &write_subset,
+                    ArrayBytes::from(indices_buf),
+                )?;
+            }
 
-                        for out_row in run.out_start..run.out_end {
-                            let src_row = run.assignments_by_out[&out_row];
-                            if let Some((d, i)) = row_map.get(&src_row) {
-                                assembled_data.extend_from_slice(d);
-                                assembled_indices.extend_from_slice(i);
-                            }
-                        }
-
-                        let write_subset = ArraySubset::new_with_ranges(
-                            &[dst_nnz_start as u64..dst_nnz_end as u64],
-                        );
-                        dst_data.store_array_subset(
-                            &write_subset,
-                            ArrayBytes::from(assembled_data),
-                        )?;
-                        dst_indices.store_array_subset(
-                            &write_subset,
-                            ArrayBytes::from(assembled_indices),
-                        )?;
-                    }
-                    Ok(())
-                })
-            },
-        )?;
-
-        Ok(())
+            Ok(())
+        })
     }
+}
+
+/// Get the 1D chunk size for a zarrs Array, or usize::MAX if unknown.
+fn get_chunk_size_1d<S>(array: &Array<S>) -> usize
+where
+    S: ReadableWritableListableStorageTraits + ?Sized + 'static,
+{
+    array
+        .chunk_grid_shape()
+        .first()
+        .and_then(|&n| {
+            if n == 0 {
+                None
+            } else {
+                array
+                    .chunk_shape(&[0u64])
+                    .ok()
+                    .and_then(|s| s.first().map(|c| c.get() as usize))
+            }
+        })
+        .unwrap_or(usize::MAX)
 }
 
 struct MergedSparseRun<'a> {
@@ -383,12 +381,6 @@ fn merge_sparse_reads<'a>(
     runs
 }
 
-/// Split merged runs into sub-runs aligned to source zarr chunk boundaries.
-///
-/// A single merged run that spans N source chunks becomes N sub-runs, each
-/// covering exactly one chunk's NNZ range. This creates N independent decode
-/// tasks for rayon even when the merge heuristic collapses all reads into
-/// one giant run (the common case for random shuffle).
 fn split_merged_runs_by_chunk<'a>(
     merged: &[MergedSparseRun<'a>],
     src_indptr: &[i64],
@@ -417,7 +409,6 @@ fn split_merged_runs_by_chunk<'a>(
             continue;
         }
 
-        // Partition assignments into per-chunk buckets by their NNZ range
         let n_chunks = last_chunk - first_chunk + 1;
         let mut buckets: Vec<Vec<&'a RowAssignment>> =
             (0..n_chunks).map(|_| Vec::new()).collect();
@@ -452,101 +443,4 @@ fn split_merged_runs_by_chunk<'a>(
         }
     }
     out
-}
-
-struct OutputRun {
-    out_start: usize,
-    out_end: usize,
-    assignments_by_out: std::collections::HashMap<usize, usize>,
-}
-
-struct ChunkGroup {
-    run_indices: Vec<usize>,
-}
-
-/// Group output runs so that runs targeting the same destination zarr chunk
-/// are in the same group. Runs in different groups touch disjoint chunks
-/// and can safely be written in parallel.
-fn group_output_runs_by_dst_chunk<S>(
-    runs: &[OutputRun],
-    out_indptr: &[i64],
-    dst_data: &Array<S>,
-) -> Vec<ChunkGroup>
-where
-    S: ReadableWritableListableStorageTraits + ?Sized + 'static,
-{
-    let chunk_size = dst_data
-        .chunk_grid_shape()
-        .first()
-        .and_then(|&n| {
-            if n == 0 {
-                None
-            } else {
-                dst_data
-                    .chunk_shape(&[0u64])
-                    .ok()
-                    .and_then(|s| s.first().map(|c| c.get() as usize))
-            }
-        })
-        .unwrap_or(usize::MAX);
-
-    let mut chunk_map: std::collections::BTreeMap<u64, Vec<usize>> =
-        std::collections::BTreeMap::new();
-    for (run_idx, run) in runs.iter().enumerate() {
-        let nnz_start = out_indptr[run.out_start] as u64;
-        let nnz_end = out_indptr[run.out_end] as u64;
-        if nnz_end <= nnz_start {
-            continue;
-        }
-        let first_chunk = nnz_start / chunk_size as u64;
-        let last_chunk = (nnz_end - 1) / chunk_size as u64;
-        for c in first_chunk..=last_chunk {
-            chunk_map.entry(c).or_default().push(run_idx);
-        }
-    }
-
-    chunk_map
-        .into_values()
-        .map(|run_indices| ChunkGroup { run_indices })
-        .collect()
-}
-
-fn find_contiguous_output_runs(
-    sorted_assigns: &[&&RowAssignment],
-    _out_indptr: &[i64],
-) -> Vec<OutputRun> {
-    if sorted_assigns.is_empty() {
-        return Vec::new();
-    }
-
-    let mut runs = Vec::new();
-    let mut cur_start = sorted_assigns[0].output_row;
-    let mut cur_end = cur_start + 1;
-    let mut cur_map = std::collections::HashMap::new();
-    cur_map.insert(sorted_assigns[0].output_row, sorted_assigns[0].source_row);
-
-    for &a in &sorted_assigns[1..] {
-        if a.output_row == cur_end {
-            cur_end += 1;
-            cur_map.insert(a.output_row, a.source_row);
-        } else {
-            runs.push(OutputRun {
-                out_start: cur_start,
-                out_end: cur_end,
-                assignments_by_out: std::mem::take(&mut cur_map),
-            });
-            cur_start = a.output_row;
-            cur_end = cur_start + 1;
-            cur_map = std::collections::HashMap::new();
-            cur_map.insert(a.output_row, a.source_row);
-        }
-    }
-
-    runs.push(OutputRun {
-        out_start: cur_start,
-        out_end: cur_end,
-        assignments_by_out: cur_map,
-    });
-
-    runs
 }

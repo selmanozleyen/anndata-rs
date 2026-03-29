@@ -35,6 +35,30 @@ pub struct ScatterPass {
     pub total_rows: usize,
 }
 
+/// Describes one destination NNZ chunk for sparse scatter.
+#[derive(Debug, Clone)]
+pub struct SparseScatterChunk {
+    pub store_id: u16,
+    pub chunk_idx: u64,
+    pub nnz_start: usize,
+    pub nnz_end: usize,
+    pub entries: Vec<SparseScatterEntry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SparseScatterEntry {
+    pub source_row: usize,
+    pub output_row: usize,
+}
+
+/// A pass is a set of destination NNZ chunks that can be filled simultaneously
+/// within the memory budget.
+#[derive(Debug)]
+pub struct SparseScatterPass {
+    pub chunks: Vec<SparseScatterChunk>,
+    pub total_nnz: usize,
+}
+
 /// Plans multi-output scatter operations.
 ///
 /// Given a list of (source_row, store_id, output_row) assignments and per-store
@@ -170,6 +194,105 @@ impl ScatterPlanner {
             .collect()
     }
 
+    /// Build an NNZ-chunk-aligned scatter plan for sparse CSR data.
+    ///
+    /// Groups assignments by which destination NNZ chunk they land in (using
+    /// the per-store output indptrs to map rows to NNZ offsets), then packs
+    /// destination chunks into passes that fit within the memory budget.
+    ///
+    /// Each `SparseScatterChunk` in the resulting passes carries the full
+    /// NNZ range for one destination chunk so it can be written as a single
+    /// whole-chunk write (no read-modify-write).
+    pub fn plan_sparse(
+        assignments: &[RowAssignment],
+        store_indptrs: &[&[i64]],
+        store_nnz_chunk_sizes: &[usize],
+        max_nnz_in_memory: usize,
+    ) -> Vec<SparseScatterPass> {
+        if assignments.is_empty() {
+            return Vec::new();
+        }
+
+        let mut chunk_map: BTreeMap<(u16, u64), Vec<SparseScatterEntry>> = BTreeMap::new();
+
+        for a in assignments {
+            let sid = a.store_id as usize;
+            let indptr = store_indptrs[sid];
+            let cs = store_nnz_chunk_sizes[sid];
+            if cs == 0 { continue; }
+            let row_nnz_start = indptr[a.output_row] as usize;
+            let chunk_idx = (row_nnz_start / cs) as u64;
+            chunk_map
+                .entry((a.store_id, chunk_idx))
+                .or_default()
+                .push(SparseScatterEntry {
+                    source_row: a.source_row,
+                    output_row: a.output_row,
+                });
+        }
+
+        let mut all_chunks: Vec<SparseScatterChunk> = Vec::with_capacity(chunk_map.len());
+
+        for ((store_id, chunk_idx), entries) in chunk_map {
+            let sid = store_id as usize;
+            let cs = store_nnz_chunk_sizes[sid];
+            let indptr = store_indptrs[sid];
+            let total_nnz = *indptr.last().unwrap_or(&0) as usize;
+            let nnz_start = chunk_idx as usize * cs;
+            let nnz_end = (nnz_start + cs).min(total_nnz);
+            all_chunks.push(SparseScatterChunk {
+                store_id,
+                chunk_idx,
+                nnz_start,
+                nnz_end,
+                entries,
+            });
+        }
+
+        let mut passes = Vec::new();
+        let mut current_chunks = Vec::new();
+        let mut current_nnz = 0usize;
+
+        for chunk in all_chunks {
+            let chunk_nnz = chunk.nnz_end - chunk.nnz_start;
+
+            if chunk_nnz > max_nnz_in_memory {
+                if !current_chunks.is_empty() {
+                    passes.push(SparseScatterPass {
+                        total_nnz: current_nnz,
+                        chunks: std::mem::take(&mut current_chunks),
+                    });
+                    current_nnz = 0;
+                }
+                passes.push(SparseScatterPass {
+                    total_nnz: chunk_nnz,
+                    chunks: vec![chunk],
+                });
+                continue;
+            }
+
+            if current_nnz + chunk_nnz > max_nnz_in_memory {
+                passes.push(SparseScatterPass {
+                    total_nnz: current_nnz,
+                    chunks: std::mem::take(&mut current_chunks),
+                });
+                current_nnz = 0;
+            }
+
+            current_nnz += chunk_nnz;
+            current_chunks.push(chunk);
+        }
+
+        if !current_chunks.is_empty() {
+            passes.push(SparseScatterPass {
+                total_nnz: current_nnz,
+                chunks: current_chunks,
+            });
+        }
+
+        passes
+    }
+
     /// Build a multi-store scatter plan from a group-by split.
     /// `group_ids[i]` is the store_id for source row i.
     /// Returns (assignments, per_store_n_rows).
@@ -275,5 +398,83 @@ mod tests {
         for window in reads.windows(2) {
             assert!(window[0].0 <= window[1].0, "source reads must be sorted");
         }
+    }
+
+    #[test]
+    fn sparse_plan_single_chunk() {
+        // 5 rows, each with 10 NNZ, dst chunk size 100 => all in one chunk
+        let assignments = ScatterPlanner::from_permutation(&[0, 1, 2, 3, 4]);
+        // indptr: [0, 10, 20, 30, 40, 50]
+        let indptr: Vec<i64> = (0..=5).map(|i| i * 10).collect();
+        let passes = ScatterPlanner::plan_sparse(
+            &assignments, &[&indptr], &[100], 1000,
+        );
+        assert_eq!(passes.len(), 1);
+        assert_eq!(passes[0].chunks.len(), 1);
+        assert_eq!(passes[0].chunks[0].nnz_start, 0);
+        assert_eq!(passes[0].chunks[0].nnz_end, 50);
+        assert_eq!(passes[0].chunks[0].entries.len(), 5);
+    }
+
+    #[test]
+    fn sparse_plan_multiple_chunks() {
+        // 10 rows, 10 NNZ each = 100 total NNZ, chunk size 30 => 4 chunks
+        let assignments = ScatterPlanner::from_permutation(&(0..10).collect::<Vec<_>>());
+        let indptr: Vec<i64> = (0..=10).map(|i| i * 10).collect();
+        let passes = ScatterPlanner::plan_sparse(
+            &assignments, &[&indptr], &[30], 1000,
+        );
+        assert_eq!(passes.len(), 1);
+        // chunk 0: rows 0,1,2 (NNZ 0..30); chunk 1: rows 3,4,5 (NNZ 30..60);
+        // chunk 2: rows 6,7,8 (NNZ 60..90); chunk 3: row 9 (NNZ 90..100)
+        assert_eq!(passes[0].chunks.len(), 4);
+
+        let total_entries: usize = passes[0].chunks.iter()
+            .map(|c| c.entries.len()).sum();
+        assert_eq!(total_entries, 10);
+    }
+
+    #[test]
+    fn sparse_plan_respects_budget() {
+        // 10 rows, 100 NNZ each = 1000 total NNZ, chunk size 200 => 5 chunks
+        // Budget of 300 NNZ => at most 1-2 chunks per pass
+        let assignments = ScatterPlanner::from_permutation(&(0..10).collect::<Vec<_>>());
+        let indptr: Vec<i64> = (0..=10).map(|i| i * 100).collect();
+        let passes = ScatterPlanner::plan_sparse(
+            &assignments, &[&indptr], &[200], 300,
+        );
+        assert!(passes.len() >= 2, "should need multiple passes with tight budget");
+        for pass in &passes {
+            assert!(
+                pass.total_nnz <= 300 || pass.chunks.len() == 1,
+                "pass NNZ {} exceeds budget 300 with {} chunks",
+                pass.total_nnz, pass.chunks.len()
+            );
+        }
+        let total_entries: usize = passes.iter()
+            .flat_map(|p| &p.chunks)
+            .map(|c| c.entries.len())
+            .sum();
+        assert_eq!(total_entries, 10);
+    }
+
+    #[test]
+    fn sparse_plan_shuffled_assignments() {
+        // Shuffled output: perm[out] = src, so output order differs from source
+        let perm = vec![4, 2, 0, 3, 1];
+        let assignments = ScatterPlanner::from_permutation(&perm);
+        let _src_indptr: Vec<i64> = vec![0, 5, 15, 20, 50, 60];
+        // out_indptr: row sizes come from src via perm
+        // out_row 0 <- src 4 (10 nnz), out_row 1 <- src 2 (5 nnz),
+        // out_row 2 <- src 0 (5 nnz), out_row 3 <- src 3 (30 nnz),
+        // out_row 4 <- src 1 (10 nnz)
+        // out_indptr = [0, 10, 15, 20, 50, 60]
+        let passes = ScatterPlanner::plan_sparse(
+            &assignments, &[&[0i64, 10, 15, 20, 50, 60]], &[100], 1000,
+        );
+        assert_eq!(passes.len(), 1);
+        let total_entries: usize = passes[0].chunks.iter()
+            .map(|c| c.entries.len()).sum();
+        assert_eq!(total_entries, 5);
     }
 }

@@ -1,16 +1,20 @@
-/// Simulates the sparse scatter I/O pattern using real Tahoe indptr data.
+/// Simulates the chunk-aligned sparse scatter I/O pattern using real indptr data.
 ///
-/// Faithfully mirrors the Rust engine's batching, merging, chunk-splitting,
-/// and write-grouping logic.  No actual Zarr I/O -- just a trace.
+/// Calls the actual `ScatterPlanner::plan_sparse()` and `ScatterPlanner::from_groups()`
+/// from the anndata-ooc core, so the simulation is guaranteed to match the engine.
 ///
 /// Run with:
 ///   cargo run -p anndata-ooc --release --example sparse_io_simulation -- --help
 ///   cargo run -p anndata-ooc --release --example sparse_io_simulation -- \
 ///       --memory-gb 4 8 16 20 32 64 --op shuffle -v
+///   cargo run -p anndata-ooc --release --example sparse_io_simulation -- \
+///       --memory-gb 16 32 64 --op groupby --split-column cell_line -v
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
+
+use anndata_ooc::{RowAssignment, ScatterPlanner, SparseScatterPass};
 
 fn main() {
     let args = parse_args();
@@ -27,6 +31,8 @@ fn main() {
     let min_nnz = *row_nnz.iter().min().unwrap_or(&0);
     let max_nnz = *row_nnz.iter().max().unwrap_or(&0);
 
+    let bytes_per_nnz = args.data_elem_size + args.indices_elem_size;
+
     eprintln!(
         "  Loaded: {} rows, {} NNZ  ({:.1}s)",
         fmt_num(n_rows),
@@ -35,9 +41,14 @@ fn main() {
     );
     eprintln!("  Avg NNZ/row: {:.1}", total_nnz as f64 / n_rows as f64);
     eprintln!("  NNZ range: [{}, {}]", min_nnz, max_nnz);
+    let uncompressed_gib = total_nnz as f64 * bytes_per_nnz as f64 / GIB;
+    // Typical compression: f32 data ~2x, i32 indices ~3x
+    let est_compressed_gib = total_nnz as f64
+        * (args.data_elem_size as f64 / 2.0 + args.indices_elem_size as f64 / 3.0) / GIB;
     eprintln!(
-        "  Data size: {:.1} GiB (4B data + 8B indices)",
-        total_nnz as f64 * 12.0 / GIB
+        "  Data size: {:.1} GiB uncompressed, ~{:.0} GiB on disk ({}B data ~2x, {}B indices ~3x)",
+        uncompressed_gib, est_compressed_gib,
+        args.data_elem_size, args.indices_elem_size
     );
 
     let mut summary: Vec<SummaryRow> = Vec::new();
@@ -52,182 +63,86 @@ fn main() {
         if args.op == "shuffle" || args.op == "all" {
             let t0 = Instant::now();
             let perm = fisher_yates(n_rows, 42);
-            let assigns: Vec<Assignment> = (0..n_rows)
-                .map(|out_row| Assignment {
+            let assignments: Vec<RowAssignment> = (0..n_rows)
+                .map(|out_row| RowAssignment {
                     source_row: perm[out_row],
                     store_id: 0,
                     output_row: out_row,
                 })
                 .collect();
 
+            let out_indptr = build_output_indptr(&assignments, &indptr, n_rows);
+
             let label = format!(
                 "SHUFFLE ({} rows, {}G)",
-                fmt_num(n_rows),
-                mem_gb
+                fmt_num(n_rows), mem_gb
             );
             let result = simulate_sparse_scatter(
-                &indptr, &assigns, memory_limit,
-                args.src_chunk_size, args.dst_chunk_size,
-                4, 8, &label, args.verbose,
+                &indptr, &assignments, &[&out_indptr],
+                memory_limit, args.src_chunk_size, args.dst_chunk_size,
+                bytes_per_nnz, &label, args.verbose,
             );
             eprintln!("  shuffle sim: {:.1}s", t0.elapsed().as_secs_f64());
-            summary.push(SummaryRow {
-                op: "shuffle", mem_gb,
-                n_rows: result.n_rows, batches: result.batches,
-                merged_runs: result.merged_runs, sub_runs: result.sub_runs,
-                dst_chunks: result.dst_chunks, read_gib: result.read_gib,
-                write_gib: result.write_gib, read_amp: result.read_amp,
-            });
+            summary.push(result.to_summary("shuffle", mem_gb));
         }
 
         if args.op == "truncate" || args.op == "all" {
             let trunc_n = n_rows.min(10_000_000);
-            let assigns: Vec<Assignment> = (0..trunc_n)
-                .map(|i| Assignment {
+            let assignments: Vec<RowAssignment> = (0..trunc_n)
+                .map(|i| RowAssignment {
                     source_row: i,
                     store_id: 0,
                     output_row: i,
                 })
                 .collect();
+            let out_indptr = build_output_indptr(&assignments, &indptr, trunc_n);
 
             let label = format!(
                 "TRUNCATE (first {} rows, {}G)",
-                fmt_num(trunc_n),
-                mem_gb
+                fmt_num(trunc_n), mem_gb
             );
             let result = simulate_sparse_scatter(
-                &indptr, &assigns, memory_limit,
-                args.src_chunk_size, args.dst_chunk_size,
-                4, 8, &label, args.verbose,
+                &indptr, &assignments, &[&out_indptr],
+                memory_limit, args.src_chunk_size, args.dst_chunk_size,
+                bytes_per_nnz, &label, args.verbose,
             );
-            summary.push(SummaryRow {
-                op: "truncate", mem_gb,
-                n_rows: result.n_rows, batches: result.batches,
-                merged_runs: result.merged_runs, sub_runs: result.sub_runs,
-                dst_chunks: result.dst_chunks, read_gib: result.read_gib,
-                write_gib: result.write_gib, read_amp: result.read_amp,
-            });
+            summary.push(result.to_summary("truncate", mem_gb));
         }
 
         if args.op == "split" || args.op == "all" {
-            let codes_path = data_dir.join("obs").join(&args.split_column).join("codes");
-            match load_obs_codes_zarr(&codes_path, n_rows) {
-                Ok(codes) => {
-                    let mut groups: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
-                    for (i, &c) in codes.iter().enumerate() {
-                        groups.entry(c).or_default().push(i);
-                    }
-                    let n_groups = groups.len();
-                    let group_sizes: Vec<usize> =
-                        groups.values().map(|v| v.len()).collect();
-                    let min_g = *group_sizes.iter().min().unwrap_or(&0);
-                    let max_g = *group_sizes.iter().max().unwrap_or(&0);
-                    let mut sorted_sizes = group_sizes.clone();
-                    sorted_sizes.sort_unstable();
-                    let median_g = sorted_sizes[sorted_sizes.len() / 2];
+            run_split_sim(
+                &data_dir, &args, &indptr, n_rows, memory_limit, mem_gb,
+                bytes_per_nnz, &mut summary,
+            );
+        }
 
-                    println!(
-                        "\n  Split column '{}': {} groups",
-                        args.split_column, n_groups
-                    );
-                    println!(
-                        "  Group sizes: min={} max={} median={}",
-                        fmt_num(min_g),
-                        fmt_num(max_g),
-                        fmt_num(median_g)
-                    );
-
-                    let mut total_read = 0.0f64;
-                    let mut total_write = 0.0f64;
-                    let mut total_batches = 0usize;
-                    let mut total_sub = 0usize;
-                    let mut total_dst = 0usize;
-
-                    for (gid, (_, src_rows)) in groups.iter().enumerate() {
-                        let assigns: Vec<Assignment> = src_rows
-                            .iter()
-                            .enumerate()
-                            .map(|(out, &src)| Assignment {
-                                source_row: src,
-                                store_id: 0,
-                                output_row: out,
-                            })
-                            .collect();
-
-                        let show = gid < 3 || gid == n_groups - 1;
-                        let label = format!(
-                            "SPLIT group {}/{} ({} rows, {}G)",
-                            gid, n_groups,
-                            fmt_num(src_rows.len()),
-                            mem_gb
-                        );
-                        let r = simulate_sparse_scatter(
-                            &indptr, &assigns, memory_limit,
-                            args.src_chunk_size, args.dst_chunk_size,
-                            4, 8, &label, args.verbose && show,
-                        );
-                        total_read += r.read_gib;
-                        total_write += r.write_gib;
-                        total_batches += r.batches;
-                        total_sub += r.sub_runs;
-                        total_dst += r.dst_chunks;
-
-                        if gid == 2 && n_groups > 4 {
-                            println!(
-                                "  ... ({} more groups omitted, showing last) ...",
-                                n_groups - 4
-                            );
-                        }
-                    }
-
-                    println!("\n  SPLIT TOTAL ({} groups):", n_groups);
-                    println!("    READ:  {:.2} GiB", total_read);
-                    println!("    WRITE: {:.2} GiB", total_write);
-                    println!("    TOTAL: {:.2} GiB", total_read + total_write);
-                    println!("    Batches: {}", total_batches);
-
-                    summary.push(SummaryRow {
-                        op: "split",
-                        mem_gb,
-                        n_rows,
-                        batches: total_batches,
-                        merged_runs: 0,
-                        sub_runs: total_sub,
-                        dst_chunks: total_dst,
-                        read_gib: total_read,
-                        write_gib: total_write,
-                        read_amp: if total_write > 0.0 {
-                            total_read / total_write
-                        } else {
-                            0.0
-                        },
-                    });
-                }
-                Err(e) => {
-                    eprintln!("  Split simulation failed: {}", e);
-                }
-            }
+        if args.op == "groupby" {
+            run_groupby_sim(
+                &data_dir, &args, &indptr, n_rows, memory_limit, mem_gb,
+                bytes_per_nnz, &mut summary,
+            );
         }
     }
 
     if summary.len() > 1 {
         println!();
-        println!("{}", "=".repeat(100));
+        println!("{}", "=".repeat(115));
         println!("SUMMARY TABLE");
-        println!("{}", "=".repeat(100));
+        println!("{}", "=".repeat(115));
         println!(
-            "{:<10} {:>6} {:>14} {:>8} {:>10} {:>10} {:>9} {:>9} {:>9} {:>8}",
-            "Op", "MemGB", "Rows", "Batches", "SubRuns", "DstChks",
+            "{:<12} {:>6} {:>14} {:>7} {:>10} {:>10} {:>10} {:>9} {:>9} {:>9} {:>8}",
+            "Op", "MemGB", "Rows", "Passes", "DstChks", "SrcChks", "SubRuns",
             "ReadGiB", "WriteGiB", "TotalGiB", "ReadAmp"
         );
         for r in &summary {
             println!(
-                "{:<10} {:>6.0} {:>14} {:>8} {:>10} {:>10} {:>9.2} {:>9.2} {:>9.2} {:>8.2}",
+                "{:<12} {:>6.0} {:>14} {:>7} {:>10} {:>10} {:>10} {:>9.2} {:>9.2} {:>9.2} {:>8.2}",
                 r.op, r.mem_gb,
                 fmt_num(r.n_rows),
-                r.batches,
+                r.passes,
+                fmt_num(r.dst_chunks_total),
+                fmt_num(r.src_chunks_read),
                 fmt_num(r.sub_runs),
-                fmt_num(r.dst_chunks),
                 r.read_gib, r.write_gib,
                 r.read_gib + r.write_gib,
                 r.read_amp,
@@ -240,175 +155,224 @@ fn main() {
 
 const GIB: f64 = (1u64 << 30) as f64;
 
-#[derive(Clone, Copy)]
-struct Assignment {
-    source_row: usize,
-    store_id: u16,
-    output_row: usize,
-}
-
 struct SimResult {
     n_rows: usize,
-    batches: usize,
-    merged_runs: usize,
+    passes: usize,
+    dst_chunks_total: usize,
+    src_chunks_read: usize,
     sub_runs: usize,
-    dst_chunks: usize,
     read_gib: f64,
     write_gib: f64,
     read_amp: f64,
+}
+
+impl SimResult {
+    fn to_summary(&self, op: &'static str, mem_gb: f64) -> SummaryRow {
+        SummaryRow {
+            op, mem_gb,
+            n_rows: self.n_rows,
+            passes: self.passes,
+            dst_chunks_total: self.dst_chunks_total,
+            src_chunks_read: self.src_chunks_read,
+            sub_runs: self.sub_runs,
+            read_gib: self.read_gib,
+            write_gib: self.write_gib,
+            read_amp: self.read_amp,
+        }
+    }
 }
 
 struct SummaryRow {
     op: &'static str,
     mem_gb: f64,
     n_rows: usize,
-    batches: usize,
-    merged_runs: usize,
+    passes: usize,
+    dst_chunks_total: usize,
+    src_chunks_read: usize,
     sub_runs: usize,
-    dst_chunks: usize,
     read_gib: f64,
     write_gib: f64,
     read_amp: f64,
 }
 
+/// Build the output indptr for a single store from assignments + source indptr.
+fn build_output_indptr(
+    assignments: &[RowAssignment],
+    src_indptr: &[i64],
+    n_out_rows: usize,
+) -> Vec<i64> {
+    let mut out = vec![0i64; n_out_rows + 1];
+    for a in assignments {
+        let row_nnz = src_indptr[a.source_row + 1] - src_indptr[a.source_row];
+        out[a.output_row + 1] = row_nnz;
+    }
+    for i in 1..out.len() {
+        out[i] += out[i - 1];
+    }
+    out
+}
+
+/// Build per-store output indptrs from multi-store assignments.
+fn build_multi_store_indptrs(
+    assignments: &[RowAssignment],
+    src_indptr: &[i64],
+    store_n_rows: &[usize],
+) -> Vec<Vec<i64>> {
+    let n_stores = store_n_rows.len();
+    let mut indptrs: Vec<Vec<i64>> = (0..n_stores)
+        .map(|s| vec![0i64; store_n_rows[s] + 1])
+        .collect();
+    for a in assignments {
+        let sid = a.store_id as usize;
+        let row_nnz = src_indptr[a.source_row + 1] - src_indptr[a.source_row];
+        indptrs[sid][a.output_row + 1] = row_nnz;
+    }
+    for s in 0..n_stores {
+        for i in 1..indptrs[s].len() {
+            indptrs[s][i] += indptrs[s][i - 1];
+        }
+    }
+    indptrs
+}
+
+/// Core simulation: calls `ScatterPlanner::plan_sparse()` then traces I/O.
 fn simulate_sparse_scatter(
-    indptr: &[i64],
-    assignments: &[Assignment],
+    src_indptr: &[i64],
+    assignments: &[RowAssignment],
+    store_indptrs: &[&[i64]],
     memory_limit: usize,
     src_chunk_size: usize,
     dst_chunk_size: usize,
-    data_elem_size: usize,
-    indices_elem_size: usize,
+    bytes_per_nnz: usize,
     label: &str,
     verbose: bool,
 ) -> SimResult {
     let n_assigns = assignments.len();
-    let bytes_per_nnz = data_elem_size + indices_elem_size;
     let headroom = 8 * 1024 * 1024usize;
     let available = memory_limit.saturating_sub(headroom);
-    let max_nnz_per_batch = if bytes_per_nnz > 0 {
-        (available / bytes_per_nnz).max(4096)
+    let max_nnz_per_pass = if bytes_per_nnz > 0 {
+        (available / bytes_per_nnz / 2).max(4096)
     } else {
         usize::MAX
     };
 
-    // Sort assignments by source indptr position
-    let mut sorted: Vec<&Assignment> = assignments.iter().collect();
-    sorted.sort_unstable_by_key(|a| indptr[a.source_row] as usize);
+    let n_stores = store_indptrs.len();
+    let store_nnz_chunk_sizes: Vec<usize> = vec![dst_chunk_size; n_stores];
 
-    // Build output indptr per store
-    let n_stores = assignments.iter().map(|a| a.store_id as usize + 1).max().unwrap_or(1);
-    let mut store_max_out: Vec<usize> = vec![0; n_stores];
-    for a in assignments {
-        store_max_out[a.store_id as usize] =
-            store_max_out[a.store_id as usize].max(a.output_row + 1);
-    }
-    let mut out_indptrs: Vec<Vec<i64>> = (0..n_stores)
-        .map(|s| vec![0i64; store_max_out[s] + 1])
-        .collect();
-    for a in assignments {
-        let sid = a.store_id as usize;
-        let row_nnz = indptr[a.source_row + 1] - indptr[a.source_row];
-        out_indptrs[sid][a.output_row + 1] = row_nnz;
-    }
-    for s in 0..n_stores {
-        for i in 1..out_indptrs[s].len() {
-            out_indptrs[s][i] += out_indptrs[s][i - 1];
-        }
-    }
+    // ---- Use the real planner ----
+    let passes = ScatterPlanner::plan_sparse(
+        assignments,
+        store_indptrs,
+        &store_nnz_chunk_sizes,
+        max_nnz_per_pass,
+    );
 
-    let total_output_nnz: i64 = out_indptrs.iter().map(|ip| *ip.last().unwrap_or(&0)).sum();
+    let total_output_nnz: u64 = store_indptrs.iter()
+        .map(|ip| *ip.last().unwrap_or(&0) as u64)
+        .sum();
 
-    // Batch by cumulative NNZ
-    let mut batch_ranges: Vec<(usize, usize)> = Vec::new();
-    let mut batch_start = 0usize;
-    let mut batch_nnz = 0usize;
-    for (idx, &a) in sorted.iter().enumerate() {
-        let row_nnz = (indptr[a.source_row + 1] - indptr[a.source_row]) as usize;
-        if batch_nnz + row_nnz > max_nnz_per_batch && batch_nnz > 0 {
-            batch_ranges.push((batch_start, idx));
-            batch_start = idx;
-            batch_nnz = 0;
-        }
-        batch_nnz += row_nnz;
-    }
-    batch_ranges.push((batch_start, sorted.len()));
+    trace_passes(
+        &passes, src_indptr, src_chunk_size, dst_chunk_size,
+        bytes_per_nnz, max_nnz_per_pass, memory_limit,
+        n_assigns, total_output_nnz,
+        label, verbose,
+    )
+}
 
-    let n_batches = batch_ranges.len();
+/// Trace I/O for a set of passes (shared by all simulation modes).
+fn trace_passes(
+    passes: &[SparseScatterPass],
+    src_indptr: &[i64],
+    src_chunk_size: usize,
+    dst_chunk_size: usize,
+    bytes_per_nnz: usize,
+    max_nnz_per_pass: usize,
+    memory_limit: usize,
+    n_assigns: usize,
+    total_output_nnz: u64,
+    label: &str,
+    verbose: bool,
+) -> SimResult {
+    let n_passes = passes.len();
+    let n_dst_chunks_total: usize = passes.iter().map(|p| p.chunks.len()).sum();
 
-    // Simulate each batch
-    let mut total_read_nnz = 0u64;
+    let mut total_src_chunks_read = 0u64;
     let mut total_write_nnz = 0u64;
-    let mut total_merged_runs = 0usize;
     let mut total_sub_runs = 0usize;
-    let mut total_dst_chunks = 0usize;
-    let mut max_batch_decoded = 0u64;
+    let mut max_pass_nnz = 0usize;
 
-    struct BatchDetail {
-        rows: usize,
-        merged: usize,
-        sub_runs: usize,
+    struct PassDetail {
         dst_chunks: usize,
+        src_chunks_read: usize,
+        unique_src_rows: usize,
+        sub_runs: usize,
         read_nnz: u64,
         write_nnz: u64,
     }
-    let mut batch_details: Vec<BatchDetail> = Vec::with_capacity(n_batches);
+    let mut pass_details: Vec<PassDetail> = Vec::with_capacity(n_passes);
 
-    for &(bs, be) in &batch_ranges {
-        let batch_assigns = &sorted[bs..be];
+    for pass in passes {
+        // Collect unique source rows (same as engine's read_pass_sources)
+        let mut source_rows: Vec<usize> = pass.chunks.iter()
+            .flat_map(|c| c.entries.iter().map(|e| e.source_row))
+            .collect();
+        source_rows.sort_unstable();
+        source_rows.dedup();
 
-        // Merge reads (exact Rust engine logic)
-        let merged = merge_sparse_reads(batch_assigns, indptr, 8192);
-        let n_merged = merged.len();
-        total_merged_runs += n_merged;
-
-        // Split at chunk boundaries
-        let sub_runs = split_merged_runs_by_chunk(&merged, indptr, src_chunk_size);
+        let merged = merge_source_reads(&source_rows, src_indptr, 8192);
+        let sub_runs = split_merged_runs_by_chunk(&merged, src_chunk_size);
         let n_sub = sub_runs.len();
         total_sub_runs += n_sub;
 
-        let batch_read_nnz: u64 = sub_runs.iter().map(|r| (r.nnz_end - r.nnz_start) as u64).sum();
-        total_read_nnz += batch_read_nnz;
-        max_batch_decoded = max_batch_decoded.max(batch_read_nnz);
+        let mut touched_src: HashSet<usize> = HashSet::new();
+        let mut pass_read_nnz = 0u64;
+        for r in &sub_runs {
+            pass_read_nnz += (r.nnz_end - r.nnz_start) as u64;
+            if src_chunk_size > 0 && src_chunk_size < usize::MAX {
+                let fc = r.nnz_start / src_chunk_size;
+                let lc = if r.nnz_end > 0 { (r.nnz_end - 1) / src_chunk_size } else { fc };
+                for c in fc..=lc {
+                    touched_src.insert(c);
+                }
+            }
+        }
+        let src_chunks_read = touched_src.len();
+        total_src_chunks_read += src_chunks_read as u64;
 
-        let batch_write_nnz: u64 = batch_assigns
-            .iter()
-            .map(|a| (indptr[a.source_row + 1] - indptr[a.source_row]) as u64)
+        let pass_write_nnz: u64 = pass.chunks.iter()
+            .map(|c| (c.nnz_end - c.nnz_start) as u64)
             .sum();
-        total_write_nnz += batch_write_nnz;
+        total_write_nnz += pass_write_nnz;
 
-        // Destination chunk groups (exact engine logic)
-        let n_dst = count_dst_chunk_groups(
-            batch_assigns, &out_indptrs, dst_chunk_size,
-        );
-        total_dst_chunks += n_dst;
+        max_pass_nnz = max_pass_nnz.max(pass.total_nnz);
 
-        batch_details.push(BatchDetail {
-            rows: be - bs,
-            merged: n_merged,
+        pass_details.push(PassDetail {
+            dst_chunks: pass.chunks.len(),
+            src_chunks_read,
+            unique_src_rows: source_rows.len(),
             sub_runs: n_sub,
-            dst_chunks: n_dst,
-            read_nnz: batch_read_nnz,
-            write_nnz: batch_write_nnz,
+            read_nnz: pass_read_nnz,
+            write_nnz: pass_write_nnz,
         });
     }
 
-    let total_nnz_src = *indptr.last().unwrap_or(&0) as u64;
+    let total_nnz_src = *src_indptr.last().unwrap_or(&0) as u64;
     let n_src_chunks = if src_chunk_size > 0 {
         (total_nnz_src as usize + src_chunk_size - 1) / src_chunk_size
     } else {
         1
     };
-    let n_dst_chunks_total = if dst_chunk_size > 0 {
+    let n_dst_chunks_ideal = if dst_chunk_size > 0 {
         (total_output_nnz as usize + dst_chunk_size - 1) / dst_chunk_size
     } else {
         1
     };
 
-    let total_read_bytes = total_read_nnz as f64 * bytes_per_nnz as f64;
+    let chunk_bytes = src_chunk_size as f64 * bytes_per_nnz as f64;
+    let total_read_bytes = total_src_chunks_read as f64 * chunk_bytes;
     let total_write_bytes = total_write_nnz as f64 * bytes_per_nnz as f64;
-    let read_amp = if total_output_nnz > 0 {
-        total_read_nnz as f64 / total_output_nnz as f64
+    let read_amp = if total_write_bytes > 0.0 {
+        total_read_bytes / total_write_bytes
     } else {
         0.0
     };
@@ -416,69 +380,70 @@ fn simulate_sparse_scatter(
     println!();
     println!("=== {} ===", label);
     println!(
-        "  Rows: {}  |  Total NNZ: {}  ({:.1} GiB)",
+        "  Rows: {}  |  Total output NNZ: {}  ({:.1} GiB)",
         fmt_num(n_assigns),
         fmt_num(total_output_nnz as usize),
         total_output_nnz as f64 * bytes_per_nnz as f64 / GIB
     );
     println!(
-        "  Source chunks: {} x {} NNZ  |  Dest chunks: {} x {} NNZ",
+        "  Source chunks: {} x {} NNZ ({:.0} MiB/chunk)  |  Dest chunks: {} x {} NNZ",
         fmt_num(n_src_chunks),
         fmt_num(src_chunk_size),
-        fmt_num(n_dst_chunks_total),
+        chunk_bytes / (1024.0 * 1024.0),
+        fmt_num(n_dst_chunks_ideal),
         fmt_num(dst_chunk_size)
     );
     println!(
-        "  Memory limit:  {:.1} GiB  |  max_nnz/batch: {}",
+        "  Memory limit:  {:.1} GiB  |  max_nnz/pass: {}",
         memory_limit as f64 / GIB,
-        fmt_num(max_nnz_per_batch)
+        fmt_num(max_nnz_per_pass)
     );
     println!();
-    println!("  Batches:       {}", n_batches);
-    let avg_merged = total_merged_runs as f64 / n_batches.max(1) as f64;
-    let avg_sub = total_sub_runs as f64 / n_batches.max(1) as f64;
-    let avg_dst = total_dst_chunks as f64 / n_batches.max(1) as f64;
+    println!("  Passes:        {}", n_passes);
     println!(
-        "  Merged runs:   {} total ({:.1}/batch)",
-        fmt_num(total_merged_runs), avg_merged
+        "  Dst chunks:    {} written (each exactly once)",
+        fmt_num(n_dst_chunks_total)
     );
+    let avg_sub = total_sub_runs as f64 / n_passes.max(1) as f64;
     println!(
-        "  Sub-runs:      {} total ({:.1}/batch) -- read parallelism tasks",
+        "  Sub-runs:      {} total ({:.1}/pass) -- read parallelism tasks",
         fmt_num(total_sub_runs), avg_sub
     );
-    println!(
-        "  Dst chunks:    {} total ({:.0}/batch) -- write parallelism tasks",
-        fmt_num(total_dst_chunks), avg_dst
-    );
     println!();
     println!(
-        "  READ:   {:.2} GiB  ({:.2}x amplification)",
-        total_read_bytes / GIB, read_amp
+        "  READ:          {:.2} GiB  ({} unique src chunks, {:.1}x amp vs ideal)",
+        total_read_bytes / GIB,
+        fmt_num(total_src_chunks_read as usize),
+        read_amp,
     );
-    println!("  WRITE:  {:.2} GiB", total_write_bytes / GIB);
     println!(
-        "  TOTAL:  {:.2} GiB",
+        "  WRITE:         {:.2} GiB  ({} dst chunks, each written once -- NO read-modify-write)",
+        total_write_bytes / GIB,
+        fmt_num(n_dst_chunks_total)
+    );
+    println!(
+        "  TOTAL I/O:     {:.2} GiB",
         (total_read_bytes + total_write_bytes) / GIB
     );
     println!(
-        "  Peak batch:    {:.2} GiB decoded",
-        max_batch_decoded as f64 * bytes_per_nnz as f64 / GIB
+        "  Peak pass:     {:.2} GiB chunk buffers",
+        max_pass_nnz as f64 * bytes_per_nnz as f64 / GIB
     );
 
-    if verbose && n_batches <= 50 {
+    if verbose && n_passes <= 50 {
         println!();
         println!(
-            "  {:>5}  {:>12}  {:>7}  {:>8}  {:>7}  {:>8}  {:>9}",
-            "Batch", "Rows", "Merged", "SubRuns", "DstChk", "ReadGiB", "WriteGiB"
+            "  {:>5}  {:>8}  {:>9}  {:>10}  {:>8}  {:>9}  {:>9}",
+            "Pass", "DstChks", "SrcChks", "SrcRows", "SubRuns", "ReadGiB", "WriteGiB"
         );
-        for (i, d) in batch_details.iter().enumerate() {
+        for (i, d) in pass_details.iter().enumerate() {
             println!(
-                "  {:5}  {:>12}  {:7}  {:8}  {:7}  {:8.3}  {:9.3}",
+                "  {:5}  {:>8}  {:>9}  {:>10}  {:>8}  {:9.3}  {:9.3}",
                 i,
-                fmt_num(d.rows),
-                d.merged,
-                d.sub_runs,
                 d.dst_chunks,
+                d.src_chunks_read,
+                fmt_num(d.unique_src_rows),
+                d.sub_runs,
                 d.read_nnz as f64 * bytes_per_nnz as f64 / GIB,
                 d.write_nnz as f64 * bytes_per_nnz as f64 / GIB,
             );
@@ -489,59 +454,286 @@ fn simulate_sparse_scatter(
 
     SimResult {
         n_rows: n_assigns,
-        batches: n_batches,
-        merged_runs: total_merged_runs,
+        passes: n_passes,
+        dst_chunks_total: n_dst_chunks_total,
+        src_chunks_read: total_src_chunks_read as usize,
         sub_runs: total_sub_runs,
-        dst_chunks: total_dst_chunks,
         read_gib: total_read_bytes / GIB,
         write_gib: total_write_bytes / GIB,
         read_amp,
     }
 }
 
-// -- Engine logic replicas (no zarr dependency, pure indptr arithmetic) --
+// -- Split mode: each group is an independent single-store scatter --
+
+fn run_split_sim(
+    data_dir: &PathBuf,
+    args: &Args,
+    indptr: &[i64],
+    n_rows: usize,
+    memory_limit: usize,
+    mem_gb: f64,
+    bytes_per_nnz: usize,
+    summary: &mut Vec<SummaryRow>,
+) {
+    let codes_path = data_dir.join("obs").join(&args.split_column).join("codes");
+    let codes = match load_obs_codes_zarr(&codes_path, n_rows) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  Split simulation failed: {}", e);
+            return;
+        }
+    };
+
+    let mut groups: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    for (i, &c) in codes.iter().enumerate() {
+        groups.entry(c).or_default().push(i);
+    }
+    let n_groups = groups.len();
+    print_group_stats(&args.split_column, &groups);
+
+    let mut total_read = 0.0f64;
+    let mut total_write = 0.0f64;
+    let mut total_passes = 0usize;
+    let mut total_sub = 0usize;
+    let mut total_dst = 0usize;
+    let mut total_src = 0usize;
+    let mut total_rows = 0usize;
+
+    for (gid, (_, src_rows)) in groups.iter().enumerate() {
+        let n_out = src_rows.len();
+        let assigns: Vec<RowAssignment> = src_rows
+            .iter()
+            .enumerate()
+            .map(|(out, &src)| RowAssignment {
+                source_row: src,
+                store_id: 0,
+                output_row: out,
+            })
+            .collect();
+        let out_indptr = build_output_indptr(&assigns, indptr, n_out);
+
+        let show = gid < 3 || gid == n_groups - 1;
+        let label = format!(
+            "SPLIT group {}/{} ({} rows, {}G)",
+            gid, n_groups, fmt_num(n_out), mem_gb
+        );
+        let r = simulate_sparse_scatter(
+            indptr, &assigns, &[&out_indptr],
+            memory_limit, args.src_chunk_size, args.dst_chunk_size,
+            bytes_per_nnz, &label, args.verbose && show,
+        );
+        total_read += r.read_gib;
+        total_write += r.write_gib;
+        total_passes += r.passes;
+        total_sub += r.sub_runs;
+        total_dst += r.dst_chunks_total;
+        total_src += r.src_chunks_read;
+        total_rows += r.n_rows;
+
+        if gid == 2 && n_groups > 4 {
+            println!(
+                "  ... ({} more groups omitted, showing last) ...",
+                n_groups - 4
+            );
+        }
+    }
+
+    println!("\n  SPLIT TOTAL ({} groups):", n_groups);
+    println!("    READ:  {:.2} GiB", total_read);
+    println!("    WRITE: {:.2} GiB", total_write);
+    println!("    TOTAL: {:.2} GiB", total_read + total_write);
+    println!("    Passes: {}", total_passes);
+
+    summary.push(SummaryRow {
+        op: "split",
+        mem_gb,
+        n_rows: total_rows,
+        passes: total_passes,
+        dst_chunks_total: total_dst,
+        src_chunks_read: total_src,
+        sub_runs: total_sub,
+        read_gib: total_read,
+        write_gib: total_write,
+        read_amp: if total_write > 0.0 { total_read / total_write } else { 0.0 },
+    });
+}
+
+// -- Groupby mode: all groups planned together as multi-store scatter --
+
+fn run_groupby_sim(
+    data_dir: &PathBuf,
+    args: &Args,
+    indptr: &[i64],
+    n_rows: usize,
+    memory_limit: usize,
+    mem_gb: f64,
+    bytes_per_nnz: usize,
+    summary: &mut Vec<SummaryRow>,
+) {
+    let codes_path = data_dir.join("obs").join(&args.split_column).join("codes");
+    let codes = match load_obs_codes_zarr(&codes_path, n_rows) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  Groupby simulation failed: {}", e);
+            return;
+        }
+    };
+
+    let mut groups: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    for (i, &c) in codes.iter().enumerate() {
+        groups.entry(c).or_default().push(i);
+    }
+    let n_groups = groups.len();
+    print_group_stats(&args.split_column, &groups);
+
+    // Map raw group codes -> contiguous store_ids 0..n_groups
+    let code_to_sid: BTreeMap<i64, u16> = groups.keys()
+        .enumerate()
+        .map(|(i, &code)| (code, i as u16))
+        .collect();
+
+    let group_ids: Vec<u16> = codes.iter()
+        .map(|&c| *code_to_sid.get(&c).unwrap())
+        .collect();
+
+    // Use the core from_groups to build assignments + per-store row counts
+    let (assignments, store_n_rows) =
+        ScatterPlanner::from_groups(&group_ids, n_groups);
+
+    let store_indptrs = build_multi_store_indptrs(&assignments, indptr, &store_n_rows);
+    let store_indptr_refs: Vec<&[i64]> = store_indptrs.iter()
+        .map(|ip| ip.as_slice())
+        .collect();
+
+    let total_output_nnz: u64 = store_indptrs.iter()
+        .map(|ip| *ip.last().unwrap_or(&0) as u64)
+        .sum();
+
+    let headroom = 8 * 1024 * 1024usize;
+    let available = memory_limit.saturating_sub(headroom);
+    let max_nnz_per_pass = if bytes_per_nnz > 0 {
+        (available / bytes_per_nnz / 2).max(4096)
+    } else {
+        usize::MAX
+    };
+
+    let store_nnz_chunk_sizes: Vec<usize> = vec![args.dst_chunk_size; n_groups];
+
+    // Use the real planner
+    let passes = ScatterPlanner::plan_sparse(
+        &assignments,
+        &store_indptr_refs,
+        &store_nnz_chunk_sizes,
+        max_nnz_per_pass,
+    );
+
+    let label = format!(
+        "GROUPBY '{}' ({} groups, {} rows, {}G)",
+        args.split_column, n_groups, fmt_num(n_rows), mem_gb
+    );
+
+    let result = trace_passes(
+        &passes, indptr, args.src_chunk_size, args.dst_chunk_size,
+        bytes_per_nnz, max_nnz_per_pass, memory_limit,
+        assignments.len(), total_output_nnz,
+        &label, args.verbose,
+    );
+
+    // Per-store breakdown
+    println!("  Per-store breakdown:");
+    println!(
+        "    {:>5}  {:>12}  {:>14}  {:>10}",
+        "Store", "Rows", "NNZ", "DstChunks"
+    );
+    for (sid, n) in store_n_rows.iter().enumerate() {
+        let store_nnz = *store_indptrs[sid].last().unwrap_or(&0) as usize;
+        let store_dst_chunks = if args.dst_chunk_size > 0 {
+            (store_nnz + args.dst_chunk_size - 1) / args.dst_chunk_size
+        } else {
+            1
+        };
+        if sid < 5 || sid == n_groups - 1 {
+            println!(
+                "    {:>5}  {:>12}  {:>14}  {:>10}",
+                sid, fmt_num(*n), fmt_num(store_nnz), fmt_num(store_dst_chunks)
+            );
+        } else if sid == 5 {
+            println!("    {:>5}  ... ({} more stores) ...", "", n_groups - 6);
+        }
+    }
+    println!();
+
+    summary.push(SummaryRow {
+        op: "groupby",
+        mem_gb,
+        n_rows,
+        passes: result.passes,
+        dst_chunks_total: result.dst_chunks_total,
+        src_chunks_read: result.src_chunks_read,
+        sub_runs: result.sub_runs,
+        read_gib: result.read_gib,
+        write_gib: result.write_gib,
+        read_amp: result.read_amp,
+    });
+}
+
+fn print_group_stats(column: &str, groups: &BTreeMap<i64, Vec<usize>>) {
+    let n_groups = groups.len();
+    let group_sizes: Vec<usize> = groups.values().map(|v| v.len()).collect();
+    let min_g = *group_sizes.iter().min().unwrap_or(&0);
+    let max_g = *group_sizes.iter().max().unwrap_or(&0);
+    let mut sorted_sizes = group_sizes.clone();
+    sorted_sizes.sort_unstable();
+    let median_g = sorted_sizes[sorted_sizes.len() / 2];
+
+    println!(
+        "\n  Column '{}': {} groups",
+        column, n_groups
+    );
+    println!(
+        "  Group sizes: min={} max={} median={}",
+        fmt_num(min_g), fmt_num(max_g), fmt_num(median_g)
+    );
+}
+
+// -- Read-side I/O simulation helpers (mirrors engine logic) --
 
 struct MergedRun {
     nnz_start: usize,
     nnz_end: usize,
-    assignments: Vec<usize>,
 }
 
-fn merge_sparse_reads(
-    batch_assigns: &[&Assignment],
+fn merge_source_reads(
+    sorted_source_rows: &[usize],
     indptr: &[i64],
     gap_nnz: usize,
 ) -> Vec<MergedRun> {
-    if batch_assigns.is_empty() {
+    if sorted_source_rows.is_empty() {
         return Vec::new();
     }
     let mut runs = Vec::new();
-    let first = batch_assigns[0];
-    let mut cur_start = indptr[first.source_row] as usize;
-    let mut cur_end = indptr[first.source_row + 1] as usize;
-    let mut cur_indices = vec![0usize];
+    let first = sorted_source_rows[0];
+    let mut cur_start = indptr[first] as usize;
+    let mut cur_end = indptr[first + 1] as usize;
 
-    for (idx, &a) in batch_assigns[1..].iter().enumerate() {
-        let lo = indptr[a.source_row] as usize;
-        let hi = indptr[a.source_row + 1] as usize;
+    for &src_row in &sorted_source_rows[1..] {
+        let lo = indptr[src_row] as usize;
+        let hi = indptr[src_row + 1] as usize;
         if lo <= cur_end + gap_nnz {
             cur_end = cur_end.max(hi);
-            cur_indices.push(idx + 1);
         } else {
             runs.push(MergedRun {
                 nnz_start: cur_start,
                 nnz_end: cur_end,
-                assignments: std::mem::take(&mut cur_indices),
             });
             cur_start = lo;
             cur_end = hi;
-            cur_indices = vec![idx + 1];
         }
     }
     runs.push(MergedRun {
         nnz_start: cur_start,
         nnz_end: cur_end,
-        assignments: cur_indices,
     });
     runs
 }
@@ -553,7 +745,6 @@ struct SubRun {
 
 fn split_merged_runs_by_chunk(
     merged: &[MergedRun],
-    _indptr: &[i64],
     src_chunk_size: usize,
 ) -> Vec<SubRun> {
     let mut out = Vec::new();
@@ -583,72 +774,6 @@ fn split_merged_runs_by_chunk(
         }
     }
     out
-}
-
-fn count_dst_chunk_groups(
-    batch_assigns: &[&Assignment],
-    out_indptrs: &[Vec<i64>],
-    dst_chunk_size: usize,
-) -> usize {
-    if dst_chunk_size == 0 {
-        return 1;
-    }
-
-    // Group by store, find contiguous output runs, then group by dst chunk
-    let mut per_store: HashMap<u16, Vec<&Assignment>> = HashMap::new();
-    for &a in batch_assigns {
-        per_store.entry(a.store_id).or_default().push(a);
-    }
-
-    let mut total = 0usize;
-    for (&sid, store_assigns) in &per_store {
-        let ip = &out_indptrs[sid as usize];
-        let mut sorted: Vec<&&Assignment> = store_assigns.iter().collect();
-        sorted.sort_unstable_by_key(|a| a.output_row);
-
-        // Find contiguous output runs
-        let runs = find_contiguous_output_runs(&sorted, ip);
-
-        // Group by destination chunk
-        let mut touched: HashSet<u64> = HashSet::new();
-        for run in &runs {
-            let nnz_start = ip[run.0] as u64;
-            let nnz_end = ip[run.1] as u64;
-            if nnz_end <= nnz_start {
-                continue;
-            }
-            let fc = nnz_start / dst_chunk_size as u64;
-            let lc = (nnz_end - 1) / dst_chunk_size as u64;
-            for c in fc..=lc {
-                touched.insert(c);
-            }
-        }
-        total += touched.len();
-    }
-    total
-}
-
-fn find_contiguous_output_runs(
-    sorted: &[&&Assignment],
-    _out_indptr: &[i64],
-) -> Vec<(usize, usize)> {
-    if sorted.is_empty() {
-        return Vec::new();
-    }
-    let mut runs = Vec::new();
-    let mut cur_start = sorted[0].output_row;
-    let mut cur_end = cur_start + 1;
-    for &a in &sorted[1..] {
-        if a.output_row == cur_end {
-            cur_end += 1;
-        } else {
-            runs.push((cur_start, cur_end));
-            cur_start = a.output_row;
-            cur_end = cur_start + 1;
-        }
-    }
-    runs.push((cur_start, cur_end));
-    runs
 }
 
 // -- I/O: load indptr from zarr chunks on disk --
@@ -694,66 +819,57 @@ fn load_indptr_zarr(zarr_path: &std::path::Path, max_rows: Option<usize>) -> Vec
     data
 }
 
+/// Load obs codes using zarrs Array API (handles any codec chain automatically).
 fn load_obs_codes_zarr(
     zarr_path: &std::path::Path,
     max_rows: usize,
 ) -> Result<Vec<i64>, String> {
-    let meta_path = zarr_path.join("zarr.json");
-    let meta_str = std::fs::read_to_string(&meta_path)
-        .map_err(|e| format!("Cannot read {:?}: {}", meta_path, e))?;
-    let meta: serde_json::Value =
-        serde_json::from_str(&meta_str).map_err(|e| format!("Invalid zarr.json: {}", e))?;
+    use std::sync::Arc;
+    use zarrs::array::{Array, ArraySubset};
+    use zarrs::filesystem::FilesystemStore;
 
-    let shape = meta["shape"][0].as_u64().ok_or("missing shape")? as usize;
-    let chunk_size = meta["chunk_grid"]["configuration"]["chunk_shape"][0]
-        .as_u64()
-        .ok_or("missing chunk_shape")? as usize;
+    // zarr_path is e.g. /path/to/store.zarr/obs/cell_line/codes
+    // The FilesystemStore needs the store root; the array path is relative.
+    // Walk up to find the store root (directory containing zarr.json at top or
+    // the parent of "obs"). We open the store at the array's parent and use
+    // "/" as array path.
+    let store = Arc::new(
+        FilesystemStore::new(zarr_path)
+            .map_err(|e| format!("Cannot open store at {:?}: {}", zarr_path, e))?
+    );
 
-    let dtype = meta["data_type"].as_str().unwrap_or("int8");
-    let elem_size: usize = match dtype {
-        "int8" | "uint8" => 1,
-        "int16" | "uint16" => 2,
-        "int32" | "uint32" => 4,
-        "int64" | "uint64" => 8,
-        _ => return Err(format!("Unsupported dtype: {}", dtype)),
-    };
+    let array = Array::open(store, "/")
+        .map_err(|e| format!("Cannot open array at {:?}: {}", zarr_path, e))?;
 
-    let n_chunks = (shape + chunk_size - 1) / chunk_size;
-    let limit = max_rows.min(shape);
+    let shape = array.shape();
+    let n_elems = shape[0] as usize;
+    let limit = max_rows.min(n_elems);
+
+    let subset = ArraySubset::new_with_ranges(&[0..limit as u64]);
+    let bytes: zarrs::array::ArrayBytes<'_> = array.retrieve_array_subset(&subset)
+        .map_err(|e| format!("Cannot read array subset: {}", e))?;
+    let raw = bytes.into_fixed()
+        .map_err(|e| format!("Not fixed-size elements: {}", e))?;
+
+    let elem_size = array.data_type().fixed_size().unwrap_or(1);
     let mut data = Vec::with_capacity(limit);
-    let chunks_dir = zarr_path.join("c");
-
-    for ci in 0..n_chunks {
-        if data.len() >= limit {
-            break;
-        }
-        let chunk_path = chunks_dir.join(ci.to_string());
-        let compressed = std::fs::read(&chunk_path)
-            .map_err(|e| format!("Cannot read chunk {:?}: {}", chunk_path, e))?;
-
-        let decompressed = blosc_decompress(&compressed);
-        let n_elems = decompressed.len() / elem_size;
-        for j in 0..n_elems {
-            if data.len() >= limit {
-                break;
-            }
-            let val = match elem_size {
-                1 => decompressed[j] as i8 as i64,
-                2 => i16::from_le_bytes(
-                    decompressed[j * 2..(j + 1) * 2].try_into().unwrap(),
-                ) as i64,
-                4 => i32::from_le_bytes(
-                    decompressed[j * 4..(j + 1) * 4].try_into().unwrap(),
-                ) as i64,
-                8 => i64::from_le_bytes(
-                    decompressed[j * 8..(j + 1) * 8].try_into().unwrap(),
-                ),
-                _ => unreachable!(),
-            };
-            data.push(val);
-        }
+    for j in 0..limit {
+        let val = match elem_size {
+            1 => raw[j] as i8 as i64,
+            2 => i16::from_le_bytes(
+                raw[j * 2..(j + 1) * 2].try_into().unwrap(),
+            ) as i64,
+            4 => i32::from_le_bytes(
+                raw[j * 4..(j + 1) * 4].try_into().unwrap(),
+            ) as i64,
+            8 => i64::from_le_bytes(
+                raw[j * 8..(j + 1) * 8].try_into().unwrap(),
+            ),
+            _ => return Err(format!("Unsupported element size: {}", elem_size)),
+        };
+        data.push(val);
     }
-    data.truncate(limit);
+
     Ok(data)
 }
 
@@ -762,37 +878,19 @@ fn blosc_decompress(input: &[u8]) -> Vec<u8> {
         return input.to_vec();
     }
 
-    // Blosc header: bytes 4..8 = uncompressed size, 8..12 = compressed size
-    let nbytes = u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
-
-    // Try blosc2 frame format first (starts with magic bytes)
-    // For blosc1 chunk format: use the C blosc library via zarrs
-    // Fallback: use flate2/lz4 directly based on the compressor byte
-    let version = input[0];
-    let _flags = input[2];
-    let _compressor = input[1]; // 0=blosclz, 1=lz4, 2=lz4hc, ...
-
-    if version == 2 {
-        // Blosc2 - the compressor byte at offset 1 in header
-        // We'll use the zarrs blosc codec
-    }
-
-    // Use the blosc-src crate or call C blosc directly.
-    // Since anndata-ooc already links zarrs with blosc support,
-    // we can use zarrs' blosc codec. But for a standalone example,
-    // let's use a raw FFI call to the blosc library that's already linked.
-
-    // Actually, let's use zarrs' codec infrastructure since it's already a dependency.
     use std::borrow::Cow;
     use zarrs::array::BytesToBytesCodecTraits;
     use zarrs::array::CodecOptions;
     use zarrs::array::BytesRepresentation;
 
+    // Blosc header bytes 4..8 = uncompressed size
+    let nbytes = u32::from_le_bytes(input[4..8].try_into().unwrap()) as u64;
+
     let blosc_config = serde_json::json!({
         "cname": "lz4",
         "clevel": 3,
-        "shuffle": "shuffle",
-        "typesize": 8,
+        "shuffle": "noshuffle",
+        "typesize": 1,
         "blocksize": 0
     });
     let codec = zarrs::array::codec::BloscCodec::new_with_configuration(
@@ -802,7 +900,7 @@ fn blosc_decompress(input: &[u8]) -> Vec<u8> {
     let decoded = codec
         .decode(
             Cow::Borrowed(input),
-            &BytesRepresentation::FixedSize(input.len() as u64),
+            &BytesRepresentation::FixedSize(nbytes),
             &CodecOptions::default(),
         )
         .expect("blosc decompress failed");
@@ -846,7 +944,6 @@ fn find_data_dir() -> PathBuf {
             break;
         }
     }
-    // Try relative to the binary
     let exe = std::env::current_exe().unwrap();
     let repo_root = exe
         .parent()
@@ -865,6 +962,8 @@ struct Args {
     n_rows: Option<usize>,
     src_chunk_size: usize,
     dst_chunk_size: usize,
+    data_elem_size: usize,
+    indices_elem_size: usize,
     op: String,
     split_column: String,
     verbose: bool,
@@ -876,6 +975,8 @@ fn parse_args() -> Args {
     let mut n_rows: Option<usize> = None;
     let mut src_chunk_size: usize = 67_108_864;
     let mut dst_chunk_size: usize = 67_108_864;
+    let mut data_elem_size: usize = 4;
+    let mut indices_elem_size: usize = 4;
     let mut op = String::from("all");
     let mut split_column = String::from("sample");
     let mut verbose = false;
@@ -905,6 +1006,16 @@ fn parse_args() -> Args {
                 dst_chunk_size = args[i].parse().expect("invalid dst-chunk-size");
                 i += 1;
             }
+            "--data-elem-size" => {
+                i += 1;
+                data_elem_size = args[i].parse().expect("invalid data-elem-size");
+                i += 1;
+            }
+            "--indices-elem-size" => {
+                i += 1;
+                indices_elem_size = args[i].parse().expect("invalid indices-elem-size");
+                i += 1;
+            }
             "--op" => {
                 i += 1;
                 op = args[i].clone();
@@ -925,9 +1036,11 @@ fn parse_args() -> Args {
                 eprintln!("  --n-rows N              Truncate indptr to N rows");
                 eprintln!("  --src-chunk-size N      Source NNZ chunk size [default: 67108864]");
                 eprintln!("  --dst-chunk-size N      Dest NNZ chunk size [default: 67108864]");
-                eprintln!("  --op OP                 shuffle|truncate|split|all [default: all]");
-                eprintln!("  --split-column COL      obs column for split [default: sample]");
-                eprintln!("  -v, --verbose           Print per-batch details");
+                eprintln!("  --data-elem-size N      Bytes per data element [default: 4 (f32)]");
+                eprintln!("  --indices-elem-size N   Bytes per index element [default: 4 (i32)]");
+                eprintln!("  --op OP                 shuffle|truncate|split|groupby|all [default: all]");
+                eprintln!("  --split-column COL      obs column for split/groupby [default: sample]");
+                eprintln!("  -v, --verbose           Print per-pass details");
                 std::process::exit(0);
             }
             _ => {
@@ -946,6 +1059,8 @@ fn parse_args() -> Args {
         n_rows,
         src_chunk_size,
         dst_chunk_size,
+        data_elem_size,
+        indices_elem_size,
         op,
         split_column,
         verbose,
