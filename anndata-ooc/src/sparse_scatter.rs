@@ -58,13 +58,10 @@ impl SparseScatterer {
             usize::MAX
         };
 
-        // Sparse 1D passthrough is disabled: sharded 1D arrays encode shard
-        // shape into the blob, so copying a shard between arrays of different
-        // total length produces an invalid shard even when the sub-chunk data
-        // is identical. Dense 2D passthrough (the high-value path for X)
-        // handles the outer chunk grid where shapes match.
+        // Sparse 1D passthrough is handled at the engine level via
+        // filesystem-level chunk file copies (see scatter_engine.rs).
+        // Here we just process whatever assignments are given to us.
         let _ = passthrough_possible;
-
         let effective_assignments: Vec<&RowAssignment> = assignments.iter().collect();
 
         // Sort assignments by source indptr position for sequential reads

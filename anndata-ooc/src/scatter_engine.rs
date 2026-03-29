@@ -101,7 +101,7 @@ pub fn scatter_anndata(
     if src_items.contains(&"X".to_string()) {
         scatter_matrix_element(
             &src_store, &dst_stores, "X", assignments, &store_n_rows, &pool,
-            &resolved_config, passthrough_possible,
+            &resolved_config, passthrough_possible, src_path, outputs,
         )?;
     }
 
@@ -114,9 +114,10 @@ pub fn scatter_anndata(
 
             let children = src_group.list()?;
             for child in &children {
+                let full_group_path = format!("{}/{}", group_name, child);
                 scatter_matrix_element_in_group(
                     &src_group, &dst_groups, child, assignments, &store_n_rows, &pool,
-                    &resolved_config, passthrough_possible,
+                    &resolved_config, passthrough_possible, src_path, outputs, &full_group_path,
                 )?;
             }
         }
@@ -193,9 +194,12 @@ fn scatter_matrix_element<G: GroupOp<Zarr>>(
     pool: &BufferPool,
     config: &ResolvedScatterConfig,
     passthrough_possible: bool,
+    src_path: &Path,
+    outputs: &[OutputStoreConfig],
 ) -> Result<()> {
     scatter_matrix_element_in_group(
-        src_store, dst_stores, name, assignments, store_n_rows, pool, config, passthrough_possible,
+        src_store, dst_stores, name, assignments, store_n_rows, pool, config,
+        passthrough_possible, src_path, outputs, name,
     )
 }
 
@@ -208,6 +212,9 @@ fn scatter_matrix_element_in_group<G: GroupOp<Zarr>>(
     pool: &BufferPool,
     config: &ResolvedScatterConfig,
     passthrough_possible: bool,
+    src_path: &Path,
+    outputs: &[OutputStoreConfig],
+    group_rel_path: &str,
 ) -> Result<()> {
     use anndata::backend::DataContainer;
 
@@ -231,6 +238,7 @@ fn scatter_matrix_element_in_group<G: GroupOp<Zarr>>(
             scatter_csr_group(
                 src_group, dst_groups, name, assignments, store_n_rows,
                 scalar_type, pool, config, passthrough_possible,
+                src_path, outputs, group_rel_path,
             )?;
         }
         DataType::CscMatrix(_) => {
@@ -305,6 +313,9 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
     pool: &BufferPool,
     config: &ResolvedScatterConfig,
     passthrough_possible: bool,
+    src_path: &Path,
+    outputs: &[OutputStoreConfig],
+    group_rel_path: &str,
 ) -> Result<()> {
     let src_g = src_group.open_group(name)?;
     let shape_attr: Vec<u64> = src_g.get_attr("shape")?;
@@ -339,6 +350,92 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
 
     let use_cloned_metadata = passthrough_possible
         && config.base.compression_level.is_none();
+
+    // Filesystem-level sparse passthrough: copy full chunk files for the
+    // identity prefix, like Python's shutil.copy2 approach.
+    // We only mark rows as "passthrough" if their entire NNZ range falls
+    // within fully-copied chunk files.
+    let mut passthrough_rows = std::collections::HashSet::new();
+    if passthrough_possible && use_cloned_metadata {
+        let identity_set: std::collections::HashSet<(u16, usize)> = assignments.iter()
+            .filter(|a| a.source_row == a.output_row)
+            .map(|a| (a.store_id, a.output_row))
+            .collect();
+
+        let chunk_size_1d = read_chunk_size_from_zarr_json(
+            &src_path.join(group_rel_path).join("data"),
+        );
+
+        for (store_id, output) in outputs.iter().enumerate() {
+            let sid = store_id as u16;
+
+            let mut prefix_end = 0usize;
+            let n_out = store_n_rows[store_id];
+            for r in 0..n_out {
+                if identity_set.contains(&(sid, r)) {
+                    prefix_end = r + 1;
+                } else {
+                    break;
+                }
+            }
+
+            if prefix_end == 0 || chunk_size_1d == 0 {
+                continue;
+            }
+
+            let raw_identity_nnz = src_indptr[prefix_end] as usize;
+            let full_chunks = raw_identity_nnz / chunk_size_1d;
+
+            if full_chunks == 0 {
+                continue;
+            }
+
+            let passthrough_nnz = full_chunks * chunk_size_1d;
+
+            // Adjust prefix_end backward: only mark rows whose NNZ range
+            // is fully covered by the copied chunk files.
+            let adjusted_prefix = {
+                let mut end = prefix_end;
+                while end > 0 && (src_indptr[end] as usize) > passthrough_nnz {
+                    end -= 1;
+                }
+                end
+            };
+
+            if adjusted_prefix == 0 {
+                continue;
+            }
+
+            let dst_path = &output.path;
+            for arr_name in &["data", "indices"] {
+                let copied = copy_1d_chunk_files(
+                    src_path, dst_path, group_rel_path, arr_name, passthrough_nnz,
+                )?;
+                log::info!(
+                    "Sparse passthrough {}/{}: copied {} full chunk files (nnz_covered={})",
+                    group_rel_path, arr_name, copied, passthrough_nnz
+                );
+            }
+
+            for r in 0..adjusted_prefix {
+                passthrough_rows.insert((sid, r));
+            }
+        }
+    }
+
+    let effective_assignments: Vec<RowAssignment> = if passthrough_rows.is_empty() {
+        assignments.to_vec()
+    } else {
+        assignments.iter()
+            .filter(|a| !passthrough_rows.contains(&(a.store_id, a.output_row)))
+            .copied()
+            .collect()
+    };
+
+    log::info!(
+        "scatter_csr_group '{}': {} total assignments, {} after passthrough filter",
+        name, assignments.len(), effective_assignments.len()
+    );
 
     let mut store_arrays: Vec<SparseStoreArrays<'_, _>> = Vec::new();
 
@@ -400,19 +497,113 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
         });
     }
 
-    let can_passthrough = passthrough_possible && use_cloned_metadata;
-
     let scatterer = SparseScatterer::new(pool.clone_with_same_budget());
     scatterer.scatter_data_indices(
         src_indices_ds.inner(),
         src_data_ds.inner(),
         &store_arrays,
-        assignments,
+        &effective_assignments,
         &src_indptr,
-        can_passthrough,
+        false,
     )?;
 
     Ok(())
+}
+
+/// Copy full chunk files for a 1D Zarr array at the filesystem level.
+///
+/// Reads zarr.json to determine chunk_shape, then copies chunk files
+/// `c/0`, `c/1`, ... for all chunks fully within [0, new_length).
+/// The partial chunk at the boundary is left for the scatter engine.
+fn copy_1d_chunk_files(
+    src_store: &Path,
+    dst_store: &Path,
+    group_name: &str,
+    array_name: &str,
+    new_length: usize,
+) -> Result<usize> {
+    let src_arr_dir = src_store.join(group_name).join(array_name);
+    let dst_arr_dir = dst_store.join(group_name).join(array_name);
+
+    let meta_path = src_arr_dir.join("zarr.json");
+    if !meta_path.exists() {
+        log::debug!("No zarr.json at {}, skipping passthrough", meta_path.display());
+        return Ok(0);
+    }
+
+    let meta_text = std::fs::read_to_string(&meta_path)
+        .with_context(|| format!("reading {}", meta_path.display()))?;
+    let meta: serde_json::Value = serde_json::from_str(&meta_text)?;
+
+    let chunk_size = extract_chunk_size_1d(&meta)?;
+    if chunk_size == 0 {
+        return Ok(0);
+    }
+
+    let full_chunks = new_length / chunk_size;
+
+    let src_chunks = src_arr_dir.join("c");
+    let dst_chunks = dst_arr_dir.join("c");
+
+    if !src_chunks.exists() {
+        return Ok(0);
+    }
+
+    std::fs::create_dir_all(&dst_chunks)
+        .with_context(|| format!("creating {}", dst_chunks.display()))?;
+
+    let mut copied = 0usize;
+    for i in 0..full_chunks {
+        let src_file = src_chunks.join(i.to_string());
+        let dst_file = dst_chunks.join(i.to_string());
+        if src_file.exists() {
+            std::fs::copy(&src_file, &dst_file)
+                .with_context(|| format!(
+                    "copying chunk {} -> {}", src_file.display(), dst_file.display()
+                ))?;
+            copied += 1;
+        }
+    }
+
+    log::debug!(
+        "{}/{}: {} full chunks of {}, copied {}",
+        group_name, array_name, full_chunks, chunk_size, copied
+    );
+
+    Ok(copied)
+}
+
+/// Read chunk size from an array's zarr.json, returning 0 if unreadable.
+fn read_chunk_size_from_zarr_json(arr_dir: &Path) -> usize {
+    let meta_path = arr_dir.join("zarr.json");
+    let Ok(text) = std::fs::read_to_string(&meta_path) else { return 0 };
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) else { return 0 };
+    extract_chunk_size_1d(&meta).unwrap_or(0)
+}
+
+/// Extract the chunk size for a 1D array from its zarr.json metadata.
+/// Handles both sharded (where chunk_shape is the shard shape) and
+/// regular chunk grids.
+fn extract_chunk_size_1d(meta: &serde_json::Value) -> Result<usize> {
+    if let Some(cs) = meta.pointer("/chunk_grid/configuration/chunk_shape/0")
+        .and_then(|v| v.as_u64())
+    {
+        return Ok(cs as usize);
+    }
+
+    if let Some(codecs) = meta.get("codecs").and_then(|c| c.as_array()) {
+        for codec in codecs {
+            if codec.get("name").and_then(|n| n.as_str()) == Some("sharding_indexed") {
+                if let Some(cs) = codec.pointer("/configuration/chunk_shape/0")
+                    .and_then(|v| v.as_u64())
+                {
+                    return Ok(cs as usize);
+                }
+            }
+        }
+    }
+
+    Ok(0)
 }
 
 fn scatter_via_anndata_select<G: GroupOp<Zarr>>(
