@@ -92,13 +92,78 @@ impl SparseScatterer {
             sorted_assigns.len(), batch_ranges.len(), max_nnz_per_batch
         );
 
-        for (batch_idx, &(start, end)) in batch_ranges.iter().enumerate() {
-            log::debug!("Batch {}/{}: {} assignments", batch_idx + 1, batch_ranges.len(), end - start);
+        // Phase 3: pipeline reads and writes across batches.
+        // While batch N is writing, batch N+1 is reading. The row_map for
+        // the next batch is built concurrently with the current batch's
+        // writes using rayon::scope.
+        type RowMap = std::collections::HashMap<usize, (Vec<u8>, Vec<u8>)>;
 
-            self.process_batch(
-                src_indices, src_data, stores,
-                &sorted_assigns[start..end],
-                src_indptr,
+        let mut prev_row_map: Option<RowMap> = None;
+        let mut prev_batch_assigns: Option<&[&RowAssignment]> = None;
+
+        for (batch_idx, &(start, end)) in batch_ranges.iter().enumerate() {
+            log::debug!(
+                "Batch {}/{}: {} assignments",
+                batch_idx + 1, batch_ranges.len(), end - start
+            );
+
+            let cur_assigns = &sorted_assigns[start..end];
+            let cur_merged = merge_sparse_reads(cur_assigns, src_indptr, 8192);
+
+            if let (Some(prev_map), Some(prev_assigns)) =
+                (prev_row_map.take(), prev_batch_assigns.take())
+            {
+                // Pipeline: overlap previous batch's writes with current
+                // batch's reads.
+                let mut next_map: Option<RowMap> = None;
+                let mut write_err: Option<anyhow::Error> = None;
+                let mut read_err: Option<anyhow::Error> = None;
+
+                rayon::scope(|s| {
+                    s.spawn(|_| {
+                        match self.write_batch(
+                            stores, prev_assigns, &prev_map,
+                            data_elem_size, indices_elem_size,
+                        ) {
+                            Ok(()) => {}
+                            Err(e) => write_err = Some(e),
+                        }
+                    });
+                    s.spawn(|_| {
+                        match Self::read_batch(
+                            src_data, src_indices, &cur_merged,
+                            src_indptr, data_elem_size, indices_elem_size,
+                            cur_assigns.len(),
+                        ) {
+                            Ok(m) => next_map = Some(m),
+                            Err(e) => read_err = Some(e),
+                        }
+                    });
+                });
+
+                if let Some(e) = write_err {
+                    return Err(e);
+                }
+                if let Some(e) = read_err {
+                    return Err(e);
+                }
+                prev_row_map = next_map;
+            } else {
+                prev_row_map = Some(Self::read_batch(
+                    src_data, src_indices, &cur_merged,
+                    src_indptr, data_elem_size, indices_elem_size,
+                    cur_assigns.len(),
+                )?);
+            }
+            prev_batch_assigns = Some(cur_assigns);
+        }
+
+        // Flush the final batch's writes
+        if let (Some(prev_map), Some(prev_assigns)) =
+            (prev_row_map.take(), prev_batch_assigns.take())
+        {
+            self.write_batch(
+                stores, prev_assigns, &prev_map,
                 data_elem_size, indices_elem_size,
             )?;
         }
@@ -106,84 +171,85 @@ impl SparseScatterer {
         Ok(())
     }
 
-    fn process_batch<S>(
-        &self,
-        src_indices: &Array<S>,
+    /// Phase 1: decode source data/indices in parallel across merged runs.
+    fn read_batch<S>(
         src_data: &Array<S>,
+        src_indices: &Array<S>,
+        merged: &[MergedSparseRun<'_>],
+        src_indptr: &[i64],
+        data_elem_size: usize,
+        indices_elem_size: usize,
+        capacity: usize,
+    ) -> Result<std::collections::HashMap<usize, (Vec<u8>, Vec<u8>)>>
+    where
+        S: ReadableWritableListableStorageTraits + ?Sized + 'static,
+    {
+        let map = Mutex::new(
+            std::collections::HashMap::<usize, (Vec<u8>, Vec<u8>)>::with_capacity(capacity),
+        );
+        merged.par_iter().try_for_each(|run| -> Result<()> {
+            if run.nnz_end <= run.nnz_start {
+                return Ok(());
+            }
+
+            let subset = ArraySubset::new_with_ranges(
+                &[run.nnz_start as u64..run.nnz_end as u64],
+            );
+
+            let data_bytes: ArrayBytes<'static> =
+                src_data.retrieve_array_subset(&subset)?;
+            let data_raw = data_bytes.into_fixed()?.into_owned();
+            let indices_bytes: ArrayBytes<'static> =
+                src_indices.retrieve_array_subset(&subset)?;
+            let indices_raw = indices_bytes.into_fixed()?.into_owned();
+
+            let mut local: Vec<(usize, Vec<u8>, Vec<u8>)> =
+                Vec::with_capacity(run.assignments.len());
+
+            for a in &run.assignments {
+                let lo = src_indptr[a.source_row] as usize;
+                let hi = src_indptr[a.source_row + 1] as usize;
+                if hi <= lo {
+                    continue;
+                }
+                let rel_lo = lo - run.nnz_start;
+                let rel_hi = hi - run.nnz_start;
+
+                let d =
+                    data_raw[rel_lo * data_elem_size..rel_hi * data_elem_size].to_vec();
+                let i = indices_raw
+                    [rel_lo * indices_elem_size..rel_hi * indices_elem_size]
+                    .to_vec();
+                local.push((a.source_row, d, i));
+            }
+
+            let mut guard = map.lock().unwrap();
+            for (src_row, d, i) in local {
+                guard.insert(src_row, (d, i));
+            }
+            Ok(())
+        })?;
+        Ok(map.into_inner().unwrap())
+    }
+
+    /// Phase 2: encode and write to destinations in parallel across chunks.
+    fn write_batch<S>(
+        &self,
         stores: &[SparseStoreArrays<'_, S>],
         batch_assigns: &[&RowAssignment],
-        src_indptr: &[i64],
+        row_map: &std::collections::HashMap<usize, (Vec<u8>, Vec<u8>)>,
         data_elem_size: usize,
         indices_elem_size: usize,
     ) -> Result<()>
     where
         S: ReadableWritableListableStorageTraits + ?Sized + 'static,
     {
-        let merged = merge_sparse_reads(batch_assigns, src_indptr, 8192);
-
-        // Phase 1: parallel merged reads -- each run covers a disjoint NNZ
-        // range so decodes are independent and can saturate all cores.
-        let row_map = {
-            let map = Mutex::new(
-                std::collections::HashMap::<usize, (Vec<u8>, Vec<u8>)>::with_capacity(
-                    batch_assigns.len(),
-                ),
-            );
-            merged.par_iter().try_for_each(|run| -> Result<()> {
-                if run.nnz_end <= run.nnz_start {
-                    return Ok(());
-                }
-
-                let subset = ArraySubset::new_with_ranges(
-                    &[run.nnz_start as u64..run.nnz_end as u64],
-                );
-
-                let data_bytes: ArrayBytes<'static> =
-                    src_data.retrieve_array_subset(&subset)?;
-                let data_raw = data_bytes.into_fixed()?.into_owned();
-                let indices_bytes: ArrayBytes<'static> =
-                    src_indices.retrieve_array_subset(&subset)?;
-                let indices_raw = indices_bytes.into_fixed()?.into_owned();
-
-                let mut local: Vec<(usize, Vec<u8>, Vec<u8>)> =
-                    Vec::with_capacity(run.assignments.len());
-
-                for a in &run.assignments {
-                    let lo = src_indptr[a.source_row] as usize;
-                    let hi = src_indptr[a.source_row + 1] as usize;
-                    if hi <= lo {
-                        continue;
-                    }
-                    let rel_lo = lo - run.nnz_start;
-                    let rel_hi = hi - run.nnz_start;
-
-                    let d = data_raw[rel_lo * data_elem_size..rel_hi * data_elem_size]
-                        .to_vec();
-                    let i = indices_raw
-                        [rel_lo * indices_elem_size..rel_hi * indices_elem_size]
-                        .to_vec();
-                    local.push((a.source_row, d, i));
-                }
-
-                let mut guard = map.lock().unwrap();
-                for (src_row, d, i) in local {
-                    guard.insert(src_row, (d, i));
-                }
-                Ok(())
-            })?;
-            map.into_inner().unwrap()
-        };
-
-        // Group batch assignments by store_id
         let n_stores = stores.len();
         let mut per_store: Vec<Vec<&RowAssignment>> = vec![Vec::new(); n_stores];
         for a in batch_assigns {
             per_store[a.store_id as usize].push(a);
         }
 
-        // Phase 2: parallel writes -- within each store, group output runs
-        // by destination zarr chunk and parallelize across chunks. Writes to
-        // distinct chunks touch independent files so there are no data races.
         per_store.par_iter().enumerate().try_for_each(
             |(store_id, store_assigns)| -> Result<()> {
                 if store_assigns.is_empty() {
@@ -193,17 +259,15 @@ impl SparseScatterer {
                 let mut sorted: Vec<&&RowAssignment> = store_assigns.iter().collect();
                 sorted.sort_unstable_by_key(|a| a.output_row);
 
-                let runs = find_contiguous_output_runs(
-                    &sorted, &stores[store_id].out_indptr,
-                );
+                let runs =
+                    find_contiguous_output_runs(&sorted, &stores[store_id].out_indptr);
 
                 let dst_data = stores[store_id].dst_data;
                 let dst_indices = stores[store_id].dst_indices;
                 let out_indptr = &stores[store_id].out_indptr;
 
-                let chunk_groups = group_output_runs_by_dst_chunk(
-                    &runs, out_indptr, dst_data,
-                );
+                let chunk_groups =
+                    group_output_runs_by_dst_chunk(&runs, out_indptr, dst_data);
 
                 chunk_groups.par_iter().try_for_each(|group| -> Result<()> {
                     for run_idx in &group.run_indices {
