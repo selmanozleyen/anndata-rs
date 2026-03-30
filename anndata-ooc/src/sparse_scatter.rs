@@ -10,6 +10,43 @@ use crate::budget::BufferPool;
 use crate::scatter::{RowAssignment, ScatterPlanner, SparsePlannerMode, SparseScatterPass, SparseScatterEntry};
 use crate::scatter_engine::ProgressCounter;
 
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeBudget {
+    pub n_threads: usize,
+    pub src_concurrent_bytes: usize,
+    pub dst_budget_bytes: usize,
+    pub max_nnz_per_pass: usize,
+}
+
+pub fn compute_runtime_sparse_budget(
+    memory_limit: usize,
+    src_chunk_size: usize,
+    bytes_per_nnz: usize,
+    n_threads: usize,
+) -> RuntimeBudget {
+    let headroom = 8 * 1024 * 1024usize;
+    let available = memory_limit.saturating_sub(headroom);
+    let src_concurrent_bytes = n_threads
+        .saturating_mul(src_chunk_size)
+        .saturating_mul(bytes_per_nnz)
+        .saturating_mul(2);
+    let dst_budget_bytes = available.saturating_sub(src_concurrent_bytes);
+    let max_nnz_per_pass = if bytes_per_nnz > 0 && dst_budget_bytes > 0 {
+        (dst_budget_bytes / bytes_per_nnz).max(4096)
+    } else if bytes_per_nnz > 0 {
+        (available / bytes_per_nnz / 2).max(4096)
+    } else {
+        usize::MAX
+    };
+
+    RuntimeBudget {
+        n_threads,
+        src_concurrent_bytes,
+        dst_budget_bytes,
+        max_nnz_per_pass,
+    }
+}
+
 /// Per-store CSR arrays and indptr for the scatter engine.
 pub struct SparseStoreArrays<'a, S: ?Sized> {
     pub dst_indices: &'a Array<S>,
@@ -57,19 +94,14 @@ impl SparseScatterer {
 
         let _ = passthrough_possible;
 
-        let headroom = 8 * 1024 * 1024;
-        let available = self.pool.budget().available().saturating_sub(headroom);
-
         let src_chunk_nnz = get_chunk_size_1d(src_data);
         let n_threads = rayon::current_num_threads();
-        let src_concurrent_bytes = n_threads * src_chunk_nnz * bytes_per_nnz * 2;
-        let dst_budget = available.saturating_sub(src_concurrent_bytes);
-
-        let max_nnz_per_pass = if bytes_per_nnz > 0 && dst_budget > 0 {
-            (dst_budget / bytes_per_nnz).max(4096)
-        } else {
-            (available / bytes_per_nnz / 2).max(4096)
-        };
+        let budget = compute_runtime_sparse_budget(
+            self.pool.budget().available(),
+            src_chunk_nnz,
+            bytes_per_nnz,
+            n_threads,
+        );
 
         let store_indptrs: Vec<&[i64]> = stores.iter()
             .map(|s| s.out_indptr.as_slice())
@@ -85,16 +117,16 @@ impl SparseScatterer {
             &store_nnz_chunk_sizes,
             src_indptr,
             src_chunk_nnz,
-            max_nnz_per_pass,
+            budget.max_nnz_per_pass,
             self.planner_mode,
         );
 
         log::info!(
             "SparseScatterer: {} assignments, {} passes (streaming), max_nnz/pass={}, \
              dst_budget={:.1}GB, src_concurrent={:.1}GB ({} threads, chunk={})",
-            assignments.len(), passes.len(), max_nnz_per_pass,
-            dst_budget as f64 / 1e9,
-            src_concurrent_bytes as f64 / 1e9,
+            assignments.len(), passes.len(), budget.max_nnz_per_pass,
+            budget.dst_budget_bytes as f64 / 1e9,
+            budget.src_concurrent_bytes as f64 / 1e9,
             n_threads, src_chunk_nnz,
         );
 

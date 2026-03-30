@@ -24,10 +24,22 @@ use std::time::Instant;
 
 use anndata_ooc::{
     RowAssignment, ScatterPlanner, SparsePlannerMode, SparseScatterPass,
+    RuntimeBudget, compute_runtime_sparse_budget,
 };
+use rayon::ThreadPoolBuilder;
 
 fn main() {
     let args = parse_args();
+    if let Some(threads) = args.threads {
+        ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .unwrap_or_else(|e| {
+                eprintln!("FATAL: failed to configure Rayon thread pool: {}", e);
+                std::process::exit(1);
+            });
+    }
+    let effective_threads = rayon::current_num_threads();
     let mut logger = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info")
     );
@@ -118,6 +130,7 @@ fn main() {
     // ---------------------------------------------------------------
     let dst_chunk_size = args.dst_chunk_size.unwrap_or(src_chunk_size);
     let row_split_stats = compute_row_split_stats(&assignments, &store_indptrs, dst_chunk_size);
+    let src_boundary_stats = compute_source_boundary_stats(&indptr, src_chunk_size);
 
     let mut summary: Vec<SummaryRow> = Vec::new();
 
@@ -142,8 +155,9 @@ fn main() {
             let result = simulate_groupby(
                 &indptr, &assignments, &store_indptr_refs,
                 planner_mode,
+                effective_threads,
                 memory_limit, src_chunk_size, dst_chunk_size,
-                bytes_per_nnz, n_rows, &row_split_stats, args.verbose,
+                bytes_per_nnz, n_rows, &row_split_stats, &src_boundary_stats, args.verbose,
             );
 
             // Per-store breakdown
@@ -237,6 +251,7 @@ fn main() {
     eprintln!("    2. For each pass, allocate destination chunk buffers.");
     eprintln!("    3. Read source sub-runs, scatter rows into those buffers.");
     eprintln!("    4. Flush each destination chunk once it is complete.");
+    eprintln!("  Rayon threads: {}", effective_threads);
     eprintln!("  Progress only moves when destination chunks flush.");
     eprintln!("  So long stretches at 0.00 GiB mean setup or read-heavy work, not a hang.");
     eprintln!("  Planner mode: {}", planner_mode_label(args.planner_mode));
@@ -247,6 +262,13 @@ fn main() {
         row_split_stats.rows_crossing_chunk_boundary as f64 * 100.0 / row_split_stats.nonempty_rows.max(1) as f64,
         row_split_stats.avg_chunks_per_nonempty_row,
         row_split_stats.max_chunks_per_row,
+    );
+    eprintln!(
+        "  Source edge rows: {} / {} nonempty rows cross a source chunk boundary ({:.4}%), max {} source chunks/row",
+        fmt(src_boundary_stats.rows_crossing_source_chunk_boundary),
+        fmt(src_boundary_stats.nonempty_rows),
+        src_boundary_stats.rows_crossing_source_chunk_boundary as f64 * 100.0 / src_boundary_stats.nonempty_rows.max(1) as f64,
+        src_boundary_stats.max_chunks_per_row,
     );
 
     std::fs::create_dir_all(&output_dir).expect("Cannot create output directory");
@@ -378,6 +400,12 @@ struct RowSplitStats {
     avg_chunks_per_nonempty_row: f64,
 }
 
+struct SourceBoundaryStats {
+    nonempty_rows: usize,
+    rows_crossing_source_chunk_boundary: usize,
+    max_chunks_per_row: usize,
+}
+
 struct SummaryRow {
     planner: &'static str,
     mem_gb: f64,
@@ -396,21 +424,23 @@ fn simulate_groupby(
     assignments: &[RowAssignment],
     store_indptrs: &[&[i64]],
     planner_mode: SparsePlannerMode,
+    n_threads: usize,
     memory_limit: usize,
     src_chunk_size: usize,
     dst_chunk_size: usize,
     bytes_per_nnz: usize,
     n_rows: usize,
     row_split_stats: &RowSplitStats,
+    src_boundary_stats: &SourceBoundaryStats,
     verbose: bool,
 ) -> SimResult {
-    let headroom = 8 * 1024 * 1024usize;
-    let available = memory_limit.saturating_sub(headroom);
-    let max_nnz_per_pass = if bytes_per_nnz > 0 {
-        (available / bytes_per_nnz / 2).max(4096)
-    } else {
-        usize::MAX
-    };
+    let budget = compute_runtime_sparse_budget(
+        memory_limit,
+        src_chunk_size,
+        bytes_per_nnz,
+        n_threads,
+    );
+    let max_nnz_per_pass = budget.max_nnz_per_pass;
 
     let n_stores = store_indptrs.len();
     let store_nnz_chunk_sizes: Vec<usize> = vec![dst_chunk_size; n_stores];
@@ -433,8 +463,8 @@ fn simulate_groupby(
 
     trace_passes(
         &passes, src_indptr, src_chunk_size, dst_chunk_size,
-        bytes_per_nnz, max_nnz_per_pass, memory_limit,
-        n_rows, total_output_nnz, row_split_stats, verbose,
+        bytes_per_nnz, &budget, memory_limit,
+        n_rows, total_output_nnz, row_split_stats, src_boundary_stats, verbose,
     )
 }
 
@@ -444,11 +474,12 @@ fn trace_passes(
     src_chunk_size: usize,
     dst_chunk_size: usize,
     bytes_per_nnz: usize,
-    max_nnz_per_pass: usize,
+    budget: &RuntimeBudget,
     memory_limit: usize,
     n_rows: usize,
     total_output_nnz: u64,
     row_split_stats: &RowSplitStats,
+    src_boundary_stats: &SourceBoundaryStats,
     verbose: bool,
 ) -> SimResult {
     let n_passes = passes.len();
@@ -594,7 +625,7 @@ fn trace_passes(
             if load_nnz == 0 {
                 0
             } else {
-                load_nnz.div_ceil(max_nnz_per_pass as u64) as usize
+                load_nnz.div_ceil(budget.max_nnz_per_pass as u64) as usize
             }
         })
         .sum();
@@ -654,7 +685,13 @@ fn trace_passes(
     );
     println!(
         "  Memory limit:  {:.1} GiB  |  max_nnz/pass: {}",
-        memory_limit as f64 / GIB, fmt(max_nnz_per_pass)
+        memory_limit as f64 / GIB, fmt(budget.max_nnz_per_pass)
+    );
+    println!(
+        "  Runtime model: {} threads  |  src_concurrent: {:.2} GiB  |  dst_budget: {:.2} GiB",
+        budget.n_threads,
+        budget.src_concurrent_bytes as f64 / GIB,
+        budget.dst_budget_bytes as f64 / GIB,
     );
     println!();
     println!("  Passes:        {}", n_passes);
@@ -666,6 +703,13 @@ fn trace_passes(
         row_split_stats.rows_crossing_chunk_boundary as f64 * 100.0 / row_split_stats.nonempty_rows.max(1) as f64,
         row_split_stats.avg_chunks_per_nonempty_row,
         row_split_stats.max_chunks_per_row,
+    );
+    println!(
+        "  Source edges:  {} / {} nonempty rows cross source chunks ({:.4}%), max {} source chunks/row",
+        fmt(src_boundary_stats.rows_crossing_source_chunk_boundary),
+        fmt(src_boundary_stats.nonempty_rows),
+        src_boundary_stats.rows_crossing_source_chunk_boundary as f64 * 100.0 / src_boundary_stats.nonempty_rows.max(1) as f64,
+        src_boundary_stats.max_chunks_per_row,
     );
     let avg_sub = total_sub_runs as f64 / n_passes.max(1) as f64;
     println!(
@@ -806,6 +850,44 @@ fn compute_row_split_stats(
         } else {
             0.0
         },
+    }
+}
+
+fn compute_source_boundary_stats(
+    src_indptr: &[i64],
+    src_chunk_size: usize,
+) -> SourceBoundaryStats {
+    if src_chunk_size == 0 || src_chunk_size == usize::MAX || src_indptr.len() < 2 {
+        return SourceBoundaryStats {
+            nonempty_rows: 0,
+            rows_crossing_source_chunk_boundary: 0,
+            max_chunks_per_row: 0,
+        };
+    }
+
+    let mut nonempty_rows = 0usize;
+    let mut rows_crossing = 0usize;
+    let mut max_chunks_per_row = 0usize;
+    for row in 0..src_indptr.len() - 1 {
+        let lo = src_indptr[row] as usize;
+        let hi = src_indptr[row + 1] as usize;
+        if hi <= lo {
+            continue;
+        }
+        nonempty_rows += 1;
+        let first_chunk = lo / src_chunk_size;
+        let last_chunk = (hi - 1) / src_chunk_size;
+        let chunks = last_chunk - first_chunk + 1;
+        max_chunks_per_row = max_chunks_per_row.max(chunks);
+        if chunks > 1 {
+            rows_crossing += 1;
+        }
+    }
+
+    SourceBoundaryStats {
+        nonempty_rows,
+        rows_crossing_source_chunk_boundary: rows_crossing,
+        max_chunks_per_row,
     }
 }
 
@@ -1087,6 +1169,7 @@ struct Args {
     column: String,
     memory_gb: Vec<f64>,
     dst_chunk_size: Option<usize>,
+    threads: Option<usize>,
     planner_mode: SparsePlannerMode,
     verbose: bool,
     run: bool,
@@ -1099,6 +1182,7 @@ fn parse_args() -> Args {
     let mut column = String::from("cell_line");
     let mut memory_gb: Vec<f64> = Vec::new();
     let mut dst_chunk_size: Option<usize> = None;
+    let mut threads: Option<usize> = None;
     let mut planner_mode = SparsePlannerMode::GroupbyAware;
     let mut verbose = false;
     let mut run = false;
@@ -1133,6 +1217,11 @@ fn parse_args() -> Args {
                 dst_chunk_size = Some(args[i].parse().expect("invalid dst-chunk-size"));
                 i += 1;
             }
+            "--threads" => {
+                i += 1;
+                threads = Some(args[i].parse().expect("invalid threads"));
+                i += 1;
+            }
             "--planner" => {
                 i += 1;
                 planner_mode = parse_planner_mode(&args[i]);
@@ -1148,6 +1237,7 @@ fn parse_args() -> Args {
                 eprintln!("  --column, -c COL       obs column for groupby [default: cell_line]");
                 eprintln!("  --memory-gb, -m N ...  Memory budgets to simulate [default: 8 16 32 64]");
                 eprintln!("  --dst-chunk-size N     Dest NNZ chunk size [default: match source]");
+                eprintln!("  --threads N            Override Rayon thread count for sim/run [default: runtime default]");
                 eprintln!("  --planner MODE         auto|greedy|groupby-aware [default: groupby-aware]");
                 eprintln!("  -v, --verbose          Print per-pass details");
                 eprintln!("  --run                  Actually execute the scatter (default: simulate only)");
@@ -1185,7 +1275,7 @@ fn parse_args() -> Args {
         std::process::exit(1);
     });
 
-    Args { input, output_dir, column, memory_gb, dst_chunk_size, planner_mode, verbose, run }
+    Args { input, output_dir, column, memory_gb, dst_chunk_size, threads, planner_mode, verbose, run }
 }
 
 fn parse_planner_mode(value: &str) -> SparsePlannerMode {
