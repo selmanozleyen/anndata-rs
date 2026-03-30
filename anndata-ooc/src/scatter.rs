@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 /// A row assignment mapping one source row to a destination (store, output_row).
@@ -57,6 +57,22 @@ pub struct SparseScatterEntry {
 pub struct SparseScatterPass {
     pub chunks: Vec<SparseScatterChunk>,
     pub total_nnz: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparsePlannerMode {
+    Auto,
+    Greedy,
+    GroupbyAware,
+}
+
+#[derive(Debug, Clone)]
+struct SparseChunkWork {
+    chunk: SparseScatterChunk,
+    chunk_nnz: usize,
+    source_chunks: Vec<usize>,
+    min_source_row: usize,
+    max_source_row: usize,
 }
 
 /// Plans multi-output scatter operations.
@@ -207,12 +223,59 @@ impl ScatterPlanner {
         assignments: &[RowAssignment],
         store_indptrs: &[&[i64]],
         store_nnz_chunk_sizes: &[usize],
+        src_indptr: &[i64],
+        src_chunk_size: usize,
         max_nnz_in_memory: usize,
+    ) -> Vec<SparseScatterPass> {
+        Self::plan_sparse_with_mode(
+            assignments,
+            store_indptrs,
+            store_nnz_chunk_sizes,
+            src_indptr,
+            src_chunk_size,
+            max_nnz_in_memory,
+            SparsePlannerMode::Auto,
+        )
+    }
+
+    pub fn plan_sparse_with_mode(
+        assignments: &[RowAssignment],
+        store_indptrs: &[&[i64]],
+        store_nnz_chunk_sizes: &[usize],
+        src_indptr: &[i64],
+        src_chunk_size: usize,
+        max_nnz_in_memory: usize,
+        planner_mode: SparsePlannerMode,
     ) -> Vec<SparseScatterPass> {
         if assignments.is_empty() {
             return Vec::new();
         }
 
+        let all_chunks = Self::build_sparse_chunks(
+            assignments,
+            store_indptrs,
+            store_nnz_chunk_sizes,
+            src_indptr,
+            src_chunk_size,
+        );
+
+        match planner_mode {
+            SparsePlannerMode::Auto | SparsePlannerMode::Greedy => {
+                Self::pack_sparse_chunks_greedy(all_chunks, max_nnz_in_memory)
+            }
+            SparsePlannerMode::GroupbyAware => {
+                Self::pack_sparse_chunks_groupby(all_chunks, max_nnz_in_memory)
+            }
+        }
+    }
+
+    fn build_sparse_chunks(
+        assignments: &[RowAssignment],
+        store_indptrs: &[&[i64]],
+        store_nnz_chunk_sizes: &[usize],
+        src_indptr: &[i64],
+        src_chunk_size: usize,
+    ) -> Vec<SparseChunkWork> {
         let mut chunk_map: BTreeMap<(u16, u64), Vec<SparseScatterEntry>> = BTreeMap::new();
 
         for a in assignments {
@@ -236,7 +299,7 @@ impl ScatterPlanner {
             }
         }
 
-        let mut all_chunks: Vec<SparseScatterChunk> = Vec::with_capacity(chunk_map.len());
+        let mut all_chunks: Vec<SparseChunkWork> = Vec::with_capacity(chunk_map.len());
 
         for ((store_id, chunk_idx), entries) in chunk_map {
             let sid = store_id as usize;
@@ -245,21 +308,62 @@ impl ScatterPlanner {
             let total_nnz = *indptr.last().unwrap_or(&0) as usize;
             let nnz_start = chunk_idx as usize * cs;
             let nnz_end = (nnz_start + cs).min(total_nnz);
-            all_chunks.push(SparseScatterChunk {
+            let chunk = SparseScatterChunk {
                 store_id,
                 chunk_idx,
                 nnz_start,
                 nnz_end,
                 entries,
+            };
+
+            let mut source_chunks = BTreeSet::new();
+            let mut min_source_row = usize::MAX;
+            let mut max_source_row = 0usize;
+            if src_chunk_size > 0 && src_chunk_size < usize::MAX {
+                for entry in &chunk.entries {
+                    min_source_row = min_source_row.min(entry.source_row);
+                    max_source_row = max_source_row.max(entry.source_row);
+                    let lo = src_indptr[entry.source_row] as usize;
+                    let hi = src_indptr[entry.source_row + 1] as usize;
+                    if hi <= lo {
+                        continue;
+                    }
+                    let first_src_chunk = lo / src_chunk_size;
+                    let last_src_chunk = (hi - 1) / src_chunk_size;
+                    for src_chunk in first_src_chunk..=last_src_chunk {
+                        source_chunks.insert(src_chunk);
+                    }
+                }
+            } else {
+                for entry in &chunk.entries {
+                    min_source_row = min_source_row.min(entry.source_row);
+                    max_source_row = max_source_row.max(entry.source_row);
+                }
+            }
+
+            all_chunks.push(SparseChunkWork {
+                chunk_nnz: nnz_end - nnz_start,
+                chunk,
+                source_chunks: source_chunks.into_iter().collect(),
+                min_source_row: if min_source_row == usize::MAX { 0 } else { min_source_row },
+                max_source_row,
             });
         }
 
+        all_chunks
+    }
+
+    fn pack_sparse_chunks_greedy(
+        all_chunks: Vec<SparseChunkWork>,
+        max_nnz_in_memory: usize,
+    ) -> Vec<SparseScatterPass> {
         let mut passes = Vec::new();
         let mut current_chunks = Vec::new();
         let mut current_nnz = 0usize;
 
-        for chunk in all_chunks {
-            let chunk_nnz = chunk.nnz_end - chunk.nnz_start;
+        for work in all_chunks {
+            let chunk_nnz = work.chunk_nnz;
+            let chunk = work.chunk;
 
             if chunk_nnz > max_nnz_in_memory {
                 if !current_chunks.is_empty() {
@@ -298,6 +402,92 @@ impl ScatterPlanner {
         passes
     }
 
+    fn pack_sparse_chunks_groupby(
+        mut all_chunks: Vec<SparseChunkWork>,
+        max_nnz_in_memory: usize,
+    ) -> Vec<SparseScatterPass> {
+        all_chunks.sort_by_key(|work| {
+            (
+                work.min_source_row,
+                work.max_source_row.saturating_sub(work.min_source_row),
+                work.chunk.store_id,
+                work.chunk.chunk_idx,
+            )
+        });
+
+        let mut passes = Vec::new();
+        let mut remaining = all_chunks;
+
+        while !remaining.is_empty() {
+            let seed = remaining.remove(0);
+            let seed_nnz = seed.chunk_nnz;
+            if seed_nnz > max_nnz_in_memory {
+                passes.push(SparseScatterPass {
+                    total_nnz: seed_nnz,
+                    chunks: vec![seed.chunk],
+                });
+                continue;
+            }
+
+            let mut current_nnz = seed_nnz;
+            let mut current_chunks = vec![seed.chunk];
+            let mut current_source_chunks: BTreeSet<usize> =
+                seed.source_chunks.iter().copied().collect();
+            let mut current_min_source_row = seed.min_source_row;
+            let mut current_max_source_row = seed.max_source_row;
+
+            loop {
+                let mut best_idx: Option<usize> = None;
+                let mut best_score: Option<(usize, usize, usize, usize, usize)> = None;
+
+                for (idx, work) in remaining.iter().enumerate() {
+                    if current_nnz + work.chunk_nnz > max_nnz_in_memory {
+                        continue;
+                    }
+
+                    let marginal_new = work.source_chunks.iter()
+                        .filter(|src_chunk| !current_source_chunks.contains(src_chunk))
+                        .count();
+                    let overlap = work.source_chunks.len().saturating_sub(marginal_new);
+                    let span_gap = source_row_gap(
+                        current_min_source_row,
+                        current_max_source_row,
+                        work.min_source_row,
+                        work.max_source_row,
+                    );
+
+                    let score = (
+                        marginal_new,
+                        span_gap,
+                        usize::MAX - overlap,
+                        usize::MAX - work.chunk_nnz,
+                        work.min_source_row,
+                    );
+
+                    if best_score.map_or(true, |best| score < best) {
+                        best_idx = Some(idx);
+                        best_score = Some(score);
+                    }
+                }
+
+                let Some(best_idx) = best_idx else { break };
+                let work = remaining.remove(best_idx);
+                current_nnz += work.chunk_nnz;
+                current_min_source_row = current_min_source_row.min(work.min_source_row);
+                current_max_source_row = current_max_source_row.max(work.max_source_row);
+                current_source_chunks.extend(work.source_chunks);
+                current_chunks.push(work.chunk);
+            }
+
+            passes.push(SparseScatterPass {
+                total_nnz: current_nnz,
+                chunks: current_chunks,
+            });
+        }
+
+        passes
+    }
+
     /// Build a multi-store scatter plan from a group-by split.
     /// `group_ids[i]` is the store_id for source row i.
     /// Returns (assignments, per_store_n_rows).
@@ -316,6 +506,21 @@ impl ScatterPlanner {
         }
 
         (assignments, store_counters)
+    }
+}
+
+fn source_row_gap(
+    a_min: usize,
+    a_max: usize,
+    b_min: usize,
+    b_max: usize,
+) -> usize {
+    if b_min > a_max {
+        b_min - a_max
+    } else if a_min > b_max {
+        a_min - b_max
+    } else {
+        0
     }
 }
 
@@ -412,7 +617,7 @@ mod tests {
         // indptr: [0, 10, 20, 30, 40, 50]
         let indptr: Vec<i64> = (0..=5).map(|i| i * 10).collect();
         let passes = ScatterPlanner::plan_sparse(
-            &assignments, &[&indptr], &[100], 1000,
+            &assignments, &[&indptr], &[100], &indptr, 100, 1000,
         );
         assert_eq!(passes.len(), 1);
         assert_eq!(passes[0].chunks.len(), 1);
@@ -427,7 +632,7 @@ mod tests {
         let assignments = ScatterPlanner::from_permutation(&(0..10).collect::<Vec<_>>());
         let indptr: Vec<i64> = (0..=10).map(|i| i * 10).collect();
         let passes = ScatterPlanner::plan_sparse(
-            &assignments, &[&indptr], &[30], 1000,
+            &assignments, &[&indptr], &[30], &indptr, 30, 1000,
         );
         assert_eq!(passes.len(), 1);
         // chunk 0: rows 0,1,2 (NNZ 0..30); chunk 1: rows 3,4,5 (NNZ 30..60);
@@ -446,7 +651,7 @@ mod tests {
         let assignments = ScatterPlanner::from_permutation(&(0..10).collect::<Vec<_>>());
         let indptr: Vec<i64> = (0..=10).map(|i| i * 100).collect();
         let passes = ScatterPlanner::plan_sparse(
-            &assignments, &[&indptr], &[200], 300,
+            &assignments, &[&indptr], &[200], &indptr, 200, 300,
         );
         assert!(passes.len() >= 2, "should need multiple passes with tight budget");
         for pass in &passes {
@@ -475,7 +680,7 @@ mod tests {
         // out_row 4 <- src 1 (10 nnz)
         // out_indptr = [0, 10, 15, 20, 50, 60]
         let passes = ScatterPlanner::plan_sparse(
-            &assignments, &[&[0i64, 10, 15, 20, 50, 60]], &[100], 1000,
+            &assignments, &[&[0i64, 10, 15, 20, 50, 60]], &[100], &_src_indptr, 100, 1000,
         );
         assert_eq!(passes.len(), 1);
         let total_entries: usize = passes[0].chunks.iter()

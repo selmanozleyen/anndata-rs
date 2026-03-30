@@ -14,7 +14,7 @@ use zarrs::storage::ReadableWritableListableStorageTraits;
 use crate::budget::{BufferPool, MemoryBudget};
 use crate::dense_scatter::DenseScatterer;
 use crate::sparse_scatter::{SparseScatterer, SparseStoreArrays};
-use crate::scatter::RowAssignment;
+use crate::scatter::{RowAssignment, SparsePlannerMode};
 
 /// Shared progress counter: bytes of compressed output written so far.
 /// Atomically incremented by the Rust engine; can be polled from Python.
@@ -32,6 +32,8 @@ pub struct ScatterConfig {
     pub compression_level: Option<u8>,
     /// Optional shared counter incremented as bytes are written.
     pub progress: Option<ProgressCounter>,
+    /// Sparse pass packer selection.
+    pub planner_mode: SparsePlannerMode,
 }
 
 impl Default for ScatterConfig {
@@ -43,6 +45,7 @@ impl Default for ScatterConfig {
             target_shard_bytes: None,
             compression_level: None,
             progress: None,
+            planner_mode: SparsePlannerMode::Auto,
         }
     }
 }
@@ -526,6 +529,7 @@ fn scatter_csr_group<G: GroupOp<Zarr>>(
     let scatterer = SparseScatterer::new(
         pool.clone_with_same_budget(),
         config.base.progress.clone(),
+        config.base.planner_mode,
     );
     scatterer.scatter_data_indices(
         src_indices_ds.inner(),

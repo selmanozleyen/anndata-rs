@@ -136,7 +136,7 @@ fn main() {
     // -- Run the scatter --
     let budget = MemoryBudget::new(memory_limit);
     let pool = BufferPool::new(budget);
-    let scatterer = SparseScatterer::new(pool, None);
+    let scatterer = SparseScatterer::new(pool, None, anndata_ooc::SparsePlannerMode::Auto);
 
     eprintln!("\n--- scatter_data_indices ---");
     let t2 = Instant::now();

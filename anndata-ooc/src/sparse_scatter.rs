@@ -7,7 +7,7 @@ use zarrs::array::{Array, ArrayBytes, ArraySubset};
 use zarrs::storage::ReadableWritableListableStorageTraits;
 
 use crate::budget::BufferPool;
-use crate::scatter::{RowAssignment, ScatterPlanner, SparseScatterPass, SparseScatterEntry};
+use crate::scatter::{RowAssignment, ScatterPlanner, SparsePlannerMode, SparseScatterPass, SparseScatterEntry};
 use crate::scatter_engine::ProgressCounter;
 
 /// Per-store CSR arrays and indptr for the scatter engine.
@@ -27,11 +27,16 @@ pub struct SparseStoreArrays<'a, S: ?Sized> {
 pub struct SparseScatterer {
     pool: BufferPool,
     progress: Option<ProgressCounter>,
+    planner_mode: SparsePlannerMode,
 }
 
 impl SparseScatterer {
-    pub fn new(pool: BufferPool, progress: Option<ProgressCounter>) -> Self {
-        Self { pool, progress }
+    pub fn new(
+        pool: BufferPool,
+        progress: Option<ProgressCounter>,
+        planner_mode: SparsePlannerMode,
+    ) -> Self {
+        Self { pool, progress, planner_mode }
     }
 
     pub fn scatter_data_indices<S>(
@@ -74,11 +79,14 @@ impl SparseScatterer {
             .map(|s| get_chunk_size_1d(s.dst_data))
             .collect();
 
-        let passes = ScatterPlanner::plan_sparse(
+        let passes = ScatterPlanner::plan_sparse_with_mode(
             assignments,
             &store_indptrs,
             &store_nnz_chunk_sizes,
+            src_indptr,
+            src_chunk_nnz,
             max_nnz_per_pass,
+            self.planner_mode,
         );
 
         log::info!(
@@ -814,7 +822,7 @@ mod tests {
 
         let budget = crate::budget::MemoryBudget::new(memory_limit);
         let pool = crate::budget::BufferPool::new(budget);
-        let scatterer = SparseScatterer::new(pool);
+        let scatterer = SparseScatterer::new(pool, None, crate::scatter::SparsePlannerMode::Auto);
         scatterer.scatter_data_indices(
             &src_idx_arr,
             &src_data_arr,

@@ -380,6 +380,8 @@ pub fn scatter(
         shard_size,
         target_shard_bytes,
         compression_level,
+        progress: None,
+        planner_mode: anndata_ooc::SparsePlannerMode::Auto,
     };
 
     let mut assignments: Vec<anndata_ooc::RowAssignment> = Vec::new();

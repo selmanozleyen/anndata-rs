@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use anndata_ooc::{
-    RowAssignment, ScatterPlanner, SparseScatterPass,
+    RowAssignment, ScatterPlanner, SparsePlannerMode, SparseScatterPass,
 };
 
 fn main() {
@@ -123,63 +123,70 @@ fn main() {
 
     for &mem_gb in &args.memory_gb {
         let memory_limit = (mem_gb * GIB) as usize;
-        println!();
-        println!("{}", "=".repeat(90));
-        println!(
-            "GROUPBY '{}': {} groups, {} rows | MEMORY {:.0} GiB",
-            args.column, n_groups, fmt(n_rows), mem_gb
-        );
-        println!("{}", "=".repeat(90));
-
         let store_indptr_refs: Vec<&[i64]> = store_indptrs.iter()
             .map(|ip| ip.as_slice())
             .collect();
 
-        let result = simulate_groupby(
-            &indptr, &assignments, &store_indptr_refs,
-            memory_limit, src_chunk_size, dst_chunk_size,
-            bytes_per_nnz, n_rows, &row_split_stats, args.verbose,
-        );
+        for &(planner_mode, planner_label) in &[
+            (SparsePlannerMode::Greedy, "greedy"),
+            (SparsePlannerMode::GroupbyAware, "groupby-aware"),
+        ] {
+            println!();
+            println!("{}", "=".repeat(90));
+            println!(
+                "GROUPBY '{}': {} groups, {} rows | MEMORY {:.0} GiB | PLANNER {}",
+                args.column, n_groups, fmt(n_rows), mem_gb, planner_label
+            );
+            println!("{}", "=".repeat(90));
 
-        // Per-store breakdown
-        println!("  Per-store breakdown:");
-        println!(
-            "    {:>5}  {:>12}  {:>14}  {:>10}  {}",
-            "Store", "Rows", "NNZ", "DstChunks", "Name"
-        );
-        for (sid, n) in store_n_rows.iter().enumerate() {
-            let store_nnz = *store_indptrs[sid].last().unwrap_or(&0) as usize;
-            let store_dst = if dst_chunk_size > 0 {
-                (store_nnz + dst_chunk_size - 1) / dst_chunk_size
-            } else {
-                1
-            };
-            let name = cat_names.as_ref()
-                .and_then(|names| names.get(sid))
-                .map(|s| s.as_str())
-                .unwrap_or("?");
-            if sid < 8 || sid >= n_groups - 2 {
-                println!(
-                    "    {:>5}  {:>12}  {:>14}  {:>10}  {}",
-                    sid, fmt(*n), fmt(store_nnz), fmt(store_dst), name
-                );
-            } else if sid == 8 {
-                println!("    {:>5}  ... ({} more groups) ...", "", n_groups - 10);
+            let result = simulate_groupby(
+                &indptr, &assignments, &store_indptr_refs,
+                planner_mode,
+                memory_limit, src_chunk_size, dst_chunk_size,
+                bytes_per_nnz, n_rows, &row_split_stats, args.verbose,
+            );
+
+            // Per-store breakdown
+            println!("  Per-store breakdown:");
+            println!(
+                "    {:>5}  {:>12}  {:>14}  {:>10}  {}",
+                "Store", "Rows", "NNZ", "DstChunks", "Name"
+            );
+            for (sid, n) in store_n_rows.iter().enumerate() {
+                let store_nnz = *store_indptrs[sid].last().unwrap_or(&0) as usize;
+                let store_dst = if dst_chunk_size > 0 {
+                    (store_nnz + dst_chunk_size - 1) / dst_chunk_size
+                } else {
+                    1
+                };
+                let name = cat_names.as_ref()
+                    .and_then(|names| names.get(sid))
+                    .map(|s| s.as_str())
+                    .unwrap_or("?");
+                if sid < 8 || sid >= n_groups - 2 {
+                    println!(
+                        "    {:>5}  {:>12}  {:>14}  {:>10}  {}",
+                        sid, fmt(*n), fmt(store_nnz), fmt(store_dst), name
+                    );
+                } else if sid == 8 {
+                    println!("    {:>5}  ... ({} more groups) ...", "", n_groups - 10);
+                }
             }
-        }
-        println!();
+            println!();
 
-        summary.push(SummaryRow {
-            mem_gb,
-            n_rows,
-            passes: result.passes,
-            dst_chunks_total: result.dst_chunks_total,
-            src_chunks_read: result.src_chunks_read,
-            sub_runs: result.sub_runs,
-            read_gib: result.read_gib,
-            write_gib: result.write_gib,
-            read_amp: result.read_amp,
-        });
+            summary.push(SummaryRow {
+                planner: planner_label,
+                mem_gb,
+                n_rows,
+                passes: result.passes,
+                dst_chunks_total: result.dst_chunks_total,
+                src_chunks_read: result.src_chunks_read,
+                sub_runs: result.sub_runs,
+                read_gib: result.read_gib,
+                write_gib: result.write_gib,
+                read_amp: result.read_amp,
+            });
+        }
     }
 
     if summary.len() > 1 {
@@ -188,14 +195,14 @@ fn main() {
         println!("SUMMARY TABLE");
         println!("{}", "=".repeat(105));
         println!(
-            "{:>6} {:>14} {:>7} {:>10} {:>10} {:>10} {:>9} {:>9} {:>9} {:>8}",
-            "MemGB", "Rows", "Passes", "DstChks", "SrcChks", "SubRuns",
+            "{:<14} {:>6} {:>14} {:>7} {:>10} {:>10} {:>10} {:>9} {:>9} {:>9} {:>8}",
+            "Planner", "MemGB", "Rows", "Passes", "DstChks", "SrcChks", "SubRuns",
             "ReadGiB", "WriteGiB", "TotalGiB", "ReadAmp"
         );
         for r in &summary {
             println!(
-                "{:>6.0} {:>14} {:>7} {:>10} {:>10} {:>10} {:>9.2} {:>9.2} {:>9.2} {:>8.2}",
-                r.mem_gb, fmt(r.n_rows),
+                "{:<14} {:>6.0} {:>14} {:>7} {:>10} {:>10} {:>10} {:>9.2} {:>9.2} {:>9.2} {:>8.2}",
+                r.planner, r.mem_gb, fmt(r.n_rows),
                 r.passes, fmt(r.dst_chunks_total), fmt(r.src_chunks_read), fmt(r.sub_runs),
                 r.read_gib, r.write_gib,
                 r.read_gib + r.write_gib,
@@ -232,6 +239,7 @@ fn main() {
     eprintln!("    4. Flush each destination chunk once it is complete.");
     eprintln!("  Progress only moves when destination chunks flush.");
     eprintln!("  So long stretches at 0.00 GiB mean setup or read-heavy work, not a hang.");
+    eprintln!("  Planner mode: {}", planner_mode_label(args.planner_mode));
     eprintln!(
         "  Row-to-chunk fanout: {} / {} nonempty rows cross a destination chunk boundary ({:.4}%), avg {:.4} chunks/nonempty-row, max {}",
         fmt(row_split_stats.rows_crossing_chunk_boundary),
@@ -304,6 +312,7 @@ fn main() {
         target_shard_bytes: None,
         compression_level: None,
         progress: Some(progress.clone()),
+        planner_mode: args.planner_mode,
     };
 
     let scatter_t0 = Instant::now();
@@ -346,6 +355,22 @@ struct SimResult {
     read_amp: f64,
 }
 
+struct PlanningMetrics {
+    lower_bound_src_chunk_touches: usize,
+    lower_bound_read_gib: f64,
+    actual_vs_lower_bound: f64,
+    mean_src_chunk_multiplicity: f64,
+    max_src_chunk_multiplicity: usize,
+    reused_src_chunks: usize,
+    reused_src_chunks_pct: f64,
+    overlap_gain_chunks: usize,
+    overlap_gain_pct: f64,
+    avg_chunk_src_footprint: f64,
+    max_chunk_src_footprint: usize,
+    median_chunk_src_span_rows: usize,
+    p95_chunk_src_span_rows: usize,
+}
+
 struct RowSplitStats {
     nonempty_rows: usize,
     rows_crossing_chunk_boundary: usize,
@@ -354,6 +379,7 @@ struct RowSplitStats {
 }
 
 struct SummaryRow {
+    planner: &'static str,
     mem_gb: f64,
     n_rows: usize,
     passes: usize,
@@ -369,6 +395,7 @@ fn simulate_groupby(
     src_indptr: &[i64],
     assignments: &[RowAssignment],
     store_indptrs: &[&[i64]],
+    planner_mode: SparsePlannerMode,
     memory_limit: usize,
     src_chunk_size: usize,
     dst_chunk_size: usize,
@@ -389,11 +416,14 @@ fn simulate_groupby(
     let store_nnz_chunk_sizes: Vec<usize> = vec![dst_chunk_size; n_stores];
 
     let t0 = Instant::now();
-    let passes = ScatterPlanner::plan_sparse(
+    let passes = ScatterPlanner::plan_sparse_with_mode(
         assignments,
         store_indptrs,
         &store_nnz_chunk_sizes,
+        src_indptr,
+        src_chunk_size,
         max_nnz_per_pass,
+        planner_mode,
     );
     eprintln!("  Planning: {:.2}s", t0.elapsed().as_secs_f64());
 
@@ -436,8 +466,23 @@ fn trace_passes(
         sub_runs: usize,
         read_nnz: u64,
         write_nnz: u64,
+        overlap_gain_chunks: usize,
+        avg_chunk_src_footprint: f64,
     }
     let mut pass_details: Vec<PassDetail> = Vec::with_capacity(n_passes);
+
+    let total_nnz_src = *src_indptr.last().unwrap_or(&0) as u64;
+    let n_src_chunks = if src_chunk_size > 0 {
+        (total_nnz_src as usize + src_chunk_size - 1) / src_chunk_size
+    } else {
+        1
+    };
+    let mut src_chunk_load_nnz = vec![0u64; n_src_chunks];
+    let mut src_chunk_pass_multiplicity = vec![0usize; n_src_chunks];
+    let mut total_chunk_footprint_sum = 0usize;
+    let mut total_overlap_gain_chunks = 0usize;
+    let mut chunk_src_footprints: Vec<usize> = Vec::new();
+    let mut chunk_src_span_rows: Vec<usize> = Vec::new();
 
     for pass in passes {
         let mut source_rows: Vec<usize> = pass.chunks.iter()
@@ -465,12 +510,55 @@ fn trace_passes(
         }
         let src_chunks_read = touched_src.len();
         total_src_chunks_read += src_chunks_read as u64;
+        for &src_chunk in &touched_src {
+            if src_chunk < src_chunk_pass_multiplicity.len() {
+                src_chunk_pass_multiplicity[src_chunk] += 1;
+            }
+        }
 
         let pass_write_nnz: u64 = pass.chunks.iter()
             .map(|c| (c.nnz_end - c.nnz_start) as u64)
             .sum();
         total_write_nnz += pass_write_nnz;
         max_pass_nnz = max_pass_nnz.max(pass.total_nnz);
+
+        let mut pass_chunk_footprint_sum = 0usize;
+        for chunk in &pass.chunks {
+            let mut chunk_src_chunks: HashSet<usize> = HashSet::new();
+            let mut min_src_row = usize::MAX;
+            let mut max_src_row = 0usize;
+            for entry in &chunk.entries {
+                min_src_row = min_src_row.min(entry.source_row);
+                max_src_row = max_src_row.max(entry.source_row);
+                let lo = src_indptr[entry.source_row] as usize;
+                let hi = src_indptr[entry.source_row + 1] as usize;
+                if hi <= lo || src_chunk_size == 0 || src_chunk_size == usize::MAX {
+                    continue;
+                }
+                let first_src_chunk = lo / src_chunk_size;
+                let last_src_chunk = (hi - 1) / src_chunk_size;
+                for src_chunk in first_src_chunk..=last_src_chunk {
+                    chunk_src_chunks.insert(src_chunk);
+                }
+            }
+
+            let footprint_size = chunk_src_chunks.len();
+            pass_chunk_footprint_sum += footprint_size;
+            total_chunk_footprint_sum += footprint_size;
+            chunk_src_footprints.push(footprint_size);
+            if min_src_row != usize::MAX {
+                chunk_src_span_rows.push(max_src_row - min_src_row + 1);
+            }
+
+            let chunk_nnz = (chunk.nnz_end - chunk.nnz_start) as u64;
+            for src_chunk in chunk_src_chunks {
+                if src_chunk < src_chunk_load_nnz.len() {
+                    src_chunk_load_nnz[src_chunk] += chunk_nnz;
+                }
+            }
+        }
+        let pass_overlap_gain = pass_chunk_footprint_sum.saturating_sub(src_chunks_read);
+        total_overlap_gain_chunks += pass_overlap_gain;
 
         pass_details.push(PassDetail {
             dst_chunks: pass.chunks.len(),
@@ -479,15 +567,14 @@ fn trace_passes(
             sub_runs: n_sub,
             read_nnz: pass_read_nnz,
             write_nnz: pass_write_nnz,
+            overlap_gain_chunks: pass_overlap_gain,
+            avg_chunk_src_footprint: if pass.chunks.is_empty() {
+                0.0
+            } else {
+                pass_chunk_footprint_sum as f64 / pass.chunks.len() as f64
+            },
         });
     }
-
-    let total_nnz_src = *src_indptr.last().unwrap_or(&0) as u64;
-    let n_src_chunks = if src_chunk_size > 0 {
-        (total_nnz_src as usize + src_chunk_size - 1) / src_chunk_size
-    } else {
-        1
-    };
     let n_dst_chunks_ideal = if dst_chunk_size > 0 {
         (total_output_nnz as usize + dst_chunk_size - 1) / dst_chunk_size
     } else {
@@ -501,6 +588,56 @@ fn trace_passes(
         total_read_bytes / total_write_bytes
     } else {
         0.0
+    };
+    let lower_bound_src_chunk_touches: usize = src_chunk_load_nnz.iter()
+        .map(|&load_nnz| {
+            if load_nnz == 0 {
+                0
+            } else {
+                load_nnz.div_ceil(max_nnz_per_pass as u64) as usize
+            }
+        })
+        .sum();
+    let lower_bound_read_bytes = lower_bound_src_chunk_touches as f64 * chunk_bytes;
+    let used_src_chunks = src_chunk_load_nnz.iter().filter(|&&load| load > 0).count();
+    let reused_src_chunks = src_chunk_pass_multiplicity.iter().filter(|&&m| m > 1).count();
+    let mean_src_chunk_multiplicity = if used_src_chunks > 0 {
+        total_src_chunks_read as f64 / used_src_chunks as f64
+    } else {
+        0.0
+    };
+    chunk_src_footprints.sort_unstable();
+    chunk_src_span_rows.sort_unstable();
+    let planning_metrics = PlanningMetrics {
+        lower_bound_src_chunk_touches,
+        lower_bound_read_gib: lower_bound_read_bytes / GIB,
+        actual_vs_lower_bound: if lower_bound_src_chunk_touches > 0 {
+            total_src_chunks_read as f64 / lower_bound_src_chunk_touches as f64
+        } else {
+            0.0
+        },
+        mean_src_chunk_multiplicity,
+        max_src_chunk_multiplicity: src_chunk_pass_multiplicity.iter().copied().max().unwrap_or(0),
+        reused_src_chunks,
+        reused_src_chunks_pct: if used_src_chunks > 0 {
+            reused_src_chunks as f64 * 100.0 / used_src_chunks as f64
+        } else {
+            0.0
+        },
+        overlap_gain_chunks: total_overlap_gain_chunks,
+        overlap_gain_pct: if total_chunk_footprint_sum > 0 {
+            total_overlap_gain_chunks as f64 * 100.0 / total_chunk_footprint_sum as f64
+        } else {
+            0.0
+        },
+        avg_chunk_src_footprint: if chunk_src_footprints.is_empty() {
+            0.0
+        } else {
+            chunk_src_footprints.iter().sum::<usize>() as f64 / chunk_src_footprints.len() as f64
+        },
+        max_chunk_src_footprint: chunk_src_footprints.iter().copied().max().unwrap_or(0),
+        median_chunk_src_span_rows: percentile_sorted(&chunk_src_span_rows, 0.50),
+        p95_chunk_src_span_rows: percentile_sorted(&chunk_src_span_rows, 0.95),
     };
 
     println!();
@@ -552,16 +689,47 @@ fn trace_passes(
         "  Peak pass:     {:.2} GiB chunk buffers",
         max_pass_nnz as f64 * bytes_per_nnz as f64 / GIB
     );
+    println!();
+    println!("  Planner quality:");
+    println!(
+        "    Lower bound: {:.2} GiB read ({} src chunk touches)",
+        planning_metrics.lower_bound_read_gib,
+        fmt(planning_metrics.lower_bound_src_chunk_touches)
+    );
+    println!(
+        "    Gap to LB:   {:.2}x actual vs lower bound",
+        planning_metrics.actual_vs_lower_bound
+    );
+    println!(
+        "    Src reuse:   mean {:.2}x, max {}x, {} / {} chunks reused across passes ({:.1}%)",
+        planning_metrics.mean_src_chunk_multiplicity,
+        planning_metrics.max_src_chunk_multiplicity,
+        fmt(planning_metrics.reused_src_chunks),
+        fmt(used_src_chunks),
+        planning_metrics.reused_src_chunks_pct,
+    );
+    println!(
+        "    Overlap:     {} duplicate chunk-touches removed within passes ({:.1}% overlap gain)",
+        fmt(planning_metrics.overlap_gain_chunks),
+        planning_metrics.overlap_gain_pct,
+    );
+    println!(
+        "    Chunk span:  avg {:.2} src chunks/chunk, max {}, median {} source rows, p95 {} source rows",
+        planning_metrics.avg_chunk_src_footprint,
+        fmt(planning_metrics.max_chunk_src_footprint),
+        fmt(planning_metrics.median_chunk_src_span_rows),
+        fmt(planning_metrics.p95_chunk_src_span_rows),
+    );
 
     if verbose && n_passes <= 80 {
         println!();
         println!(
-            "  {:>5}  {:>8}  {:>9}  {:>10}  {:>8}  {:>9}  {:>9}",
-            "Pass", "DstChks", "SrcChks", "SrcRows", "SubRuns", "ReadGiB", "WriteGiB"
+            "  {:>5}  {:>8}  {:>9}  {:>10}  {:>8}  {:>9}  {:>9}  {:>8}  {:>8}",
+            "Pass", "DstChks", "SrcChks", "SrcRows", "SubRuns", "ReadGiB", "WriteGiB", "Ovlp", "AvgFp"
         );
         for (i, d) in pass_details.iter().enumerate() {
             println!(
-                "  {:5}  {:>8}  {:>9}  {:>10}  {:>8}  {:9.3}  {:9.3}",
+                "  {:5}  {:>8}  {:>9}  {:>10}  {:>8}  {:9.3}  {:9.3}  {:>8}  {:>8.2}",
                 i,
                 d.dst_chunks,
                 d.src_chunks_read,
@@ -569,6 +737,8 @@ fn trace_passes(
                 d.sub_runs,
                 d.read_nnz as f64 * bytes_per_nnz as f64 / GIB,
                 d.write_nnz as f64 * bytes_per_nnz as f64 / GIB,
+                fmt(d.overlap_gain_chunks),
+                d.avg_chunk_src_footprint,
             );
             println!(
                 "         writes: {}",
@@ -661,6 +831,14 @@ fn summarize_pass_destinations(pass: &SparseScatterPass) -> String {
         parts.push(format!("s{}:c{}-{}({})", store_id, first, last, count));
     }
     parts.join("  ")
+}
+
+fn percentile_sorted(values: &[usize], q: f64) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    let idx = ((values.len() - 1) as f64 * q.clamp(0.0, 1.0)).round() as usize;
+    values[idx]
 }
 
 // ---------------------------------------------------------------------------
@@ -909,6 +1087,7 @@ struct Args {
     column: String,
     memory_gb: Vec<f64>,
     dst_chunk_size: Option<usize>,
+    planner_mode: SparsePlannerMode,
     verbose: bool,
     run: bool,
 }
@@ -920,6 +1099,7 @@ fn parse_args() -> Args {
     let mut column = String::from("cell_line");
     let mut memory_gb: Vec<f64> = Vec::new();
     let mut dst_chunk_size: Option<usize> = None;
+    let mut planner_mode = SparsePlannerMode::GroupbyAware;
     let mut verbose = false;
     let mut run = false;
 
@@ -953,6 +1133,11 @@ fn parse_args() -> Args {
                 dst_chunk_size = Some(args[i].parse().expect("invalid dst-chunk-size"));
                 i += 1;
             }
+            "--planner" => {
+                i += 1;
+                planner_mode = parse_planner_mode(&args[i]);
+                i += 1;
+            }
             "-v" | "--verbose" => { verbose = true; i += 1; }
             "--run" => { run = true; i += 1; }
             "--help" | "-h" => {
@@ -963,6 +1148,7 @@ fn parse_args() -> Args {
                 eprintln!("  --column, -c COL       obs column for groupby [default: cell_line]");
                 eprintln!("  --memory-gb, -m N ...  Memory budgets to simulate [default: 8 16 32 64]");
                 eprintln!("  --dst-chunk-size N     Dest NNZ chunk size [default: match source]");
+                eprintln!("  --planner MODE         auto|greedy|groupby-aware [default: groupby-aware]");
                 eprintln!("  -v, --verbose          Print per-pass details");
                 eprintln!("  --run                  Actually execute the scatter (default: simulate only)");
                 eprintln!();
@@ -999,5 +1185,25 @@ fn parse_args() -> Args {
         std::process::exit(1);
     });
 
-    Args { input, output_dir, column, memory_gb, dst_chunk_size, verbose, run }
+    Args { input, output_dir, column, memory_gb, dst_chunk_size, planner_mode, verbose, run }
+}
+
+fn parse_planner_mode(value: &str) -> SparsePlannerMode {
+    match value {
+        "auto" => SparsePlannerMode::Auto,
+        "greedy" => SparsePlannerMode::Greedy,
+        "groupby-aware" | "groupby_aware" | "groupby" => SparsePlannerMode::GroupbyAware,
+        other => {
+            eprintln!("ERROR: invalid planner mode '{}'. Use auto|greedy|groupby-aware.", other);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn planner_mode_label(mode: SparsePlannerMode) -> &'static str {
+    match mode {
+        SparsePlannerMode::Auto => "auto",
+        SparsePlannerMode::Greedy => "greedy",
+        SparsePlannerMode::GroupbyAware => "groupby-aware",
+    }
 }

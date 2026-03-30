@@ -264,6 +264,8 @@ fn simulate_sparse_scatter(
         assignments,
         store_indptrs,
         &store_nnz_chunk_sizes,
+        src_indptr,
+        src_chunk_size,
         max_nnz_per_pass,
     );
 
@@ -625,6 +627,8 @@ fn run_groupby_sim(
         &assignments,
         &store_indptr_refs,
         &store_nnz_chunk_sizes,
+        indptr,
+        args.src_chunk_size,
         max_nnz_per_pass,
     );
 
