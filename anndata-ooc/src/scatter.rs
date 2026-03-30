@@ -64,6 +64,7 @@ pub enum SparsePlannerMode {
     Auto,
     Greedy,
     GroupbyAware,
+    GroupbyOptimized,
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +267,9 @@ impl ScatterPlanner {
             SparsePlannerMode::GroupbyAware => {
                 Self::pack_sparse_chunks_groupby(all_chunks, max_nnz_in_memory)
             }
+            SparsePlannerMode::GroupbyOptimized => {
+                Self::pack_sparse_chunks_groupby_optimized(all_chunks, max_nnz_in_memory)
+            }
         }
     }
 
@@ -406,6 +410,26 @@ impl ScatterPlanner {
         mut all_chunks: Vec<SparseChunkWork>,
         max_nnz_in_memory: usize,
     ) -> Vec<SparseScatterPass> {
+        Self::pack_sparse_chunks_groupby_work(&mut all_chunks, max_nnz_in_memory)
+            .into_iter()
+            .map(Self::materialize_sparse_pass)
+            .collect()
+    }
+
+    fn pack_sparse_chunks_groupby_optimized(
+        mut all_chunks: Vec<SparseChunkWork>,
+        max_nnz_in_memory: usize,
+    ) -> Vec<SparseScatterPass> {
+        let mut passes = Self::pack_sparse_chunks_groupby_work(&mut all_chunks, max_nnz_in_memory);
+        Self::optimize_groupby_passes(&mut passes, max_nnz_in_memory);
+        passes.retain(|pass| !pass.is_empty());
+        passes.into_iter().map(Self::materialize_sparse_pass).collect()
+    }
+
+    fn pack_sparse_chunks_groupby_work(
+        all_chunks: &mut Vec<SparseChunkWork>,
+        max_nnz_in_memory: usize,
+    ) -> Vec<Vec<SparseChunkWork>> {
         all_chunks.sort_by_key(|work| {
             (
                 work.min_source_row,
@@ -416,21 +440,18 @@ impl ScatterPlanner {
         });
 
         let mut passes = Vec::new();
-        let mut remaining = all_chunks;
+        let mut remaining = std::mem::take(all_chunks);
 
         while !remaining.is_empty() {
             let seed = remaining.remove(0);
             let seed_nnz = seed.chunk_nnz;
             if seed_nnz > max_nnz_in_memory {
-                passes.push(SparseScatterPass {
-                    total_nnz: seed_nnz,
-                    chunks: vec![seed.chunk],
-                });
+                passes.push(vec![seed]);
                 continue;
             }
 
             let mut current_nnz = seed_nnz;
-            let mut current_chunks = vec![seed.chunk];
+            let mut current_chunks = vec![seed.clone()];
             let mut current_source_chunks: BTreeSet<usize> =
                 seed.source_chunks.iter().copied().collect();
             let mut current_min_source_row = seed.min_source_row;
@@ -475,17 +496,90 @@ impl ScatterPlanner {
                 current_nnz += work.chunk_nnz;
                 current_min_source_row = current_min_source_row.min(work.min_source_row);
                 current_max_source_row = current_max_source_row.max(work.max_source_row);
-                current_source_chunks.extend(work.source_chunks);
-                current_chunks.push(work.chunk);
+                current_source_chunks.extend(work.source_chunks.iter().copied());
+                current_chunks.push(work);
             }
 
-            passes.push(SparseScatterPass {
-                total_nnz: current_nnz,
-                chunks: current_chunks,
-            });
+            passes.push(current_chunks);
         }
 
         passes
+    }
+
+    fn materialize_sparse_pass(pass: Vec<SparseChunkWork>) -> SparseScatterPass {
+        let total_nnz = pass.iter().map(|work| work.chunk_nnz).sum();
+        let chunks = pass.into_iter().map(|work| work.chunk).collect();
+        SparseScatterPass { chunks, total_nnz }
+    }
+
+    fn optimize_groupby_passes(
+        passes: &mut [Vec<SparseChunkWork>],
+        max_nnz_in_memory: usize,
+    ) {
+        let max_rounds = 4;
+        for _ in 0..max_rounds {
+            let mut best_move: Option<(isize, usize, usize, usize, usize, usize)> = None;
+
+            for from_idx in 0..passes.len() {
+                if passes[from_idx].is_empty() {
+                    continue;
+                }
+                let from_touch_before = pass_source_touch_count(&passes[from_idx]);
+                let from_nnz = pass_total_nnz(&passes[from_idx]);
+
+                for chunk_pos in 0..passes[from_idx].len() {
+                    let candidate = &passes[from_idx][chunk_pos];
+                    for to_idx in 0..passes.len() {
+                        if to_idx == from_idx {
+                            continue;
+                        }
+
+                        let to_nnz = pass_total_nnz(&passes[to_idx]);
+                        if to_nnz + candidate.chunk_nnz > max_nnz_in_memory {
+                            continue;
+                        }
+
+                        let to_touch_before = pass_source_touch_count(&passes[to_idx]);
+                        let from_touch_after =
+                            pass_source_touch_count_without(&passes[from_idx], chunk_pos);
+                        let to_touch_after =
+                            pass_source_touch_count_with_extra(&passes[to_idx], candidate);
+                        let touch_delta = (from_touch_after + to_touch_after) as isize
+                            - (from_touch_before + to_touch_before) as isize;
+                        if touch_delta > 0 {
+                            continue;
+                        }
+
+                        let from_nnz_after = from_nnz - candidate.chunk_nnz;
+                        let to_nnz_after = to_nnz + candidate.chunk_nnz;
+                        let max_pass_nnz_after = from_nnz_after.max(to_nnz_after);
+                        let max_pass_touch_after = from_touch_after.max(to_touch_after);
+                        let score = (
+                            touch_delta,
+                            max_pass_touch_after,
+                            max_pass_nnz_after,
+                            to_idx,
+                            from_idx,
+                            chunk_pos,
+                        );
+
+                        if best_move.map_or(true, |best| score < best) {
+                            best_move = Some(score);
+                        }
+                    }
+                }
+            }
+
+            let Some((touch_delta, _, _, to_idx, from_idx, chunk_pos)) = best_move else {
+                break;
+            };
+            if touch_delta > 0 {
+                break;
+            }
+
+            let work = passes[from_idx].remove(chunk_pos);
+            passes[to_idx].push(work);
+        }
     }
 
     /// Build a multi-store scatter plan from a group-by split.
@@ -522,6 +616,38 @@ fn source_row_gap(
     } else {
         0
     }
+}
+
+fn pass_total_nnz(pass: &[SparseChunkWork]) -> usize {
+    pass.iter().map(|work| work.chunk_nnz).sum()
+}
+
+fn pass_source_touch_count(pass: &[SparseChunkWork]) -> usize {
+    let mut union = BTreeSet::new();
+    for work in pass {
+        union.extend(work.source_chunks.iter().copied());
+    }
+    union.len()
+}
+
+fn pass_source_touch_count_without(pass: &[SparseChunkWork], skip_idx: usize) -> usize {
+    let mut union = BTreeSet::new();
+    for (idx, work) in pass.iter().enumerate() {
+        if idx == skip_idx {
+            continue;
+        }
+        union.extend(work.source_chunks.iter().copied());
+    }
+    union.len()
+}
+
+fn pass_source_touch_count_with_extra(pass: &[SparseChunkWork], extra: &SparseChunkWork) -> usize {
+    let mut union = BTreeSet::new();
+    for work in pass {
+        union.extend(work.source_chunks.iter().copied());
+    }
+    union.extend(extra.source_chunks.iter().copied());
+    union.len()
 }
 
 #[cfg(test)]
@@ -686,5 +812,33 @@ mod tests {
         let total_entries: usize = passes[0].chunks.iter()
             .map(|c| c.entries.len()).sum();
         assert_eq!(total_entries, 5);
+    }
+
+    #[test]
+    fn sparse_plan_groupby_optimized_mode() {
+        let assignments = ScatterPlanner::from_permutation(&(0..10).collect::<Vec<_>>());
+        let indptr: Vec<i64> = (0..=10).map(|i| i * 100).collect();
+        let passes = ScatterPlanner::plan_sparse_with_mode(
+            &assignments,
+            &[&indptr],
+            &[200],
+            &indptr,
+            200,
+            300,
+            SparsePlannerMode::GroupbyOptimized,
+        );
+        assert!(passes.len() >= 2, "should need multiple passes with tight budget");
+        for pass in &passes {
+            assert!(
+                pass.total_nnz <= 300 || pass.chunks.len() == 1,
+                "pass NNZ {} exceeds budget 300 with {} chunks",
+                pass.total_nnz, pass.chunks.len()
+            );
+        }
+        let total_entries: usize = passes.iter()
+            .flat_map(|p| &p.chunks)
+            .map(|c| c.entries.len())
+            .sum();
+        assert_eq!(total_entries, 10);
     }
 }

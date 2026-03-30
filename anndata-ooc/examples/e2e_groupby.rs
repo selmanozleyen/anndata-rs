@@ -140,10 +140,7 @@ fn main() {
             .map(|ip| ip.as_slice())
             .collect();
 
-        for &(planner_mode, planner_label) in &[
-            (SparsePlannerMode::Greedy, "greedy"),
-            (SparsePlannerMode::GroupbyAware, "groupby-aware"),
-        ] {
+        for &(planner_mode, planner_label) in simulation_planners(args.planner_mode) {
             println!();
             println!("{}", "=".repeat(90));
             println!(
@@ -1238,7 +1235,7 @@ fn parse_args() -> Args {
                 eprintln!("  --memory-gb, -m N ...  Memory budgets to simulate [default: 8 16 32 64]");
                 eprintln!("  --dst-chunk-size N     Dest NNZ chunk size [default: match source]");
                 eprintln!("  --threads N            Override Rayon thread count for sim/run [default: runtime default]");
-                eprintln!("  --planner MODE         auto|greedy|groupby-aware [default: groupby-aware]");
+                eprintln!("  --planner MODE         auto|greedy|groupby-aware|groupby-optimized [default: groupby-aware]");
                 eprintln!("  -v, --verbose          Print per-pass details");
                 eprintln!("  --run                  Actually execute the scatter (default: simulate only)");
                 eprintln!();
@@ -1283,9 +1280,30 @@ fn parse_planner_mode(value: &str) -> SparsePlannerMode {
         "auto" => SparsePlannerMode::Auto,
         "greedy" => SparsePlannerMode::Greedy,
         "groupby-aware" | "groupby_aware" | "groupby" => SparsePlannerMode::GroupbyAware,
+        "groupby-optimized" | "groupby_optimized" | "optimized" => {
+            SparsePlannerMode::GroupbyOptimized
+        }
         other => {
-            eprintln!("ERROR: invalid planner mode '{}'. Use auto|greedy|groupby-aware.", other);
+            eprintln!(
+                "ERROR: invalid planner mode '{}'. Use auto|greedy|groupby-aware|groupby-optimized.",
+                other
+            );
             std::process::exit(1);
+        }
+    }
+}
+
+fn simulation_planners(mode: SparsePlannerMode) -> &'static [(SparsePlannerMode, &'static str)] {
+    match mode {
+        SparsePlannerMode::Auto => &[
+            (SparsePlannerMode::Greedy, "greedy"),
+            (SparsePlannerMode::GroupbyAware, "groupby-aware"),
+            (SparsePlannerMode::GroupbyOptimized, "groupby-optimized"),
+        ],
+        SparsePlannerMode::Greedy => &[(SparsePlannerMode::Greedy, "greedy")],
+        SparsePlannerMode::GroupbyAware => &[(SparsePlannerMode::GroupbyAware, "groupby-aware")],
+        SparsePlannerMode::GroupbyOptimized => {
+            &[(SparsePlannerMode::GroupbyOptimized, "groupby-optimized")]
         }
     }
 }
@@ -1295,5 +1313,6 @@ fn planner_mode_label(mode: SparsePlannerMode) -> &'static str {
         SparsePlannerMode::Auto => "auto",
         SparsePlannerMode::Greedy => "greedy",
         SparsePlannerMode::GroupbyAware => "groupby-aware",
+        SparsePlannerMode::GroupbyOptimized => "groupby-optimized",
     }
 }
