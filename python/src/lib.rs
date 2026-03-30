@@ -10,6 +10,7 @@ use anyhow::Result;
     text_signature = "(input, outputs, *, memory_limit=None, chunk_size=None, shard_size=None, target_shard_bytes=None, compression_level=None)",
 )]
 pub fn scatter(
+    py: Python<'_>,
     input: PathBuf,
     outputs: Vec<(PathBuf, PyReadonlyArray1<i64>)>,
     memory_limit: Option<usize>,
@@ -45,7 +46,9 @@ pub fn scatter(
         }
     }
 
-    anndata_ooc::scatter_anndata(&input, &output_configs, &assignments, &config)
+    py.allow_threads(|| {
+        anndata_ooc::scatter_anndata(&input, &output_configs, &assignments, &config)
+    })
 }
 
 #[pymodule]

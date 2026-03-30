@@ -31,7 +31,7 @@ fn main() {
     // Simulate the user's dataset at 1/10 scale to keep it quick but
     // expose the same algorithmic costs.
     //
-    // Real:  10M rows,  15.2B NNZ,  256K chunk, ~60K chunks
+    // Real:  10M rows,  15.2B NNZ,  349310 chunk, ~43K chunks
     // Bench:  1M rows, 1.52B NNZ  -- too big for memory
     //
     // Use 1M rows, ~150 NNZ/row => 150M NNZ total.
@@ -47,11 +47,11 @@ fn main() {
     let src_chunk: usize = std::env::var("BENCH_SRC_CHUNK")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(256 * 1024);
+        .unwrap_or(349_310);
     let dst_chunk: usize = std::env::var("BENCH_DST_CHUNK")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(256 * 1024);
+        .unwrap_or(349_310);
     let memory_limit: usize = std::env::var("BENCH_MEM")
         .ok()
         .and_then(|v| v.parse().ok())

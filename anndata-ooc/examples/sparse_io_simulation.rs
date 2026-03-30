@@ -973,8 +973,8 @@ fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
     let mut memory_gb: Vec<f64> = Vec::new();
     let mut n_rows: Option<usize> = None;
-    let mut src_chunk_size: usize = 67_108_864;
-    let mut dst_chunk_size: usize = 67_108_864;
+    let mut src_chunk_size: usize = 349_310;
+    let mut dst_chunk_size: usize = 349_310;
     let mut data_elem_size: usize = 4;
     let mut indices_elem_size: usize = 4;
     let mut op = String::from("all");
